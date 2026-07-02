@@ -249,3 +249,47 @@ jobs:
             exit 1
           fi
           curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
+
+      # The usw cell deploys as steps in this job — not a separate job — for
+      # the same reason CD Migrate's cell push is a step: a second job
+      # referencing the production environment would double any approval
+      # gate. Steps run after the primary verify, so a bad rollout stops at
+      # the primary. The cell reuses the SHA-tagged image pushed above
+      # (Cloud Run pulls cross-region from Artifact Registry); steps skip
+      # until CLOUD_RUN_SERVICE_USW is set (repo-level variable).
+      - name: Deploy usw cell to Cloud Run
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        run: |
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
+            --region ${{ vars.GCP_REGION_USW }} \
+            --project ${{ vars.GCP_PROJECT }}
+
+      - name: Route usw cell traffic to the new revision
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
+          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      # No /health curl for the cell: it has no public invoker binding until
+      # go-live, so an unauthenticated probe 403s regardless of health.
+      # Ready latest revision at 100% traffic is the deploy-success signal.
+      - name: Verify usw cell latest revision serves traffic
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        run: |
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USW }}
+          ARGS="--region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
