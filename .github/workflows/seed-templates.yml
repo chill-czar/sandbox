@@ -141,7 +141,9 @@ jobs:
     if: github.event_name == 'push' || github.event.inputs.environment == 'production'
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 45
+    # Two blocking seeder invocations (primary, then the usw cell), each with
+    # the seeder's default 30-min build wait — 90 covers both plus slack.
+    timeout-minutes: 90
     needs: [seed-staging]
     steps:
       - uses: actions/checkout@v4
@@ -201,5 +203,23 @@ jobs:
             $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_PROD }}
+          FORCE_REBUILD: ${{ steps.stale.outputs.force }}
+
+      # The usw cell seeds after the primary — a step in this job, not a
+      # second environment-referencing job, so a protected production
+      # environment gates one approval (same shape as CD Migrate's cell
+      # step). Skipped until CLOUD_RUN_SERVICE_USW (the repo-level
+      # cell-exists flag) is set. Each cell's own build supervisor picks up
+      # the enqueued builds and runs them on that cell's hosts; the system
+      # team UUID is deliberately identical across cells, so the prod
+      # secret is reused.
+      - name: Seed usw cell
+        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        run: |
+          go run ./cmd/seed-templates --dir superserve_templates \
+            $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
           SYSTEM_TEAM_ID: ${{ secrets.SYSTEM_TEAM_ID_PROD }}
           FORCE_REBUILD: ${{ steps.stale.outputs.force }}
