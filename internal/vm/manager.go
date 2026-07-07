@@ -18,6 +18,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -199,6 +200,11 @@ type Manager struct {
 
 	mu  sync.RWMutex
 	vms map[string]*VMInstance
+
+	// reattachSF dedups concurrent on-demand reattach of the same VM, so a
+	// request that arrives before the background startup pass has reached its
+	// VM loads it once from BoltDB instead of racing.
+	reattachSF singleflight.Group
 
 	// restoreSem bounds concurrent RestoreVMSnapshot operations. Buffered
 	// channel; capacity = effective MaxConcurrentRestores.
@@ -1227,6 +1233,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		vmID = uuid.New().String()
 	}
 
+	// Load a paused VM the background reattach hasn't reached yet, so the inPlace
+	// path below reuses its slot instead of allocating a fresh one. No-op for a
+	// new VM (not in BoltDB).
+	m.lazyReattach(vmID)
+
 	m.mu.Lock()
 	_, inPlace := m.vms[vmID]
 	if inPlace {
@@ -1529,80 +1540,22 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		m.log.Info().Int("count", len(records)).Msg("reattaching VMs from BoltDB")
 	}
 
-	// Phase A: reattach from BoltDB.
-	for _, rec := range records {
-		log := m.log.With().Str("vm_id", rec.ID).Logger()
-
-		// Paused VMs legitimately have no running systemd unit — they
-		// were stopped during pause and are waiting for a resume via
-		// their snapshot. Reattach them with their paused status so the
-		// resume path can find them.
-		if rec.Status == StatusPaused {
-			inst := toInstance(rec)
-			m.mu.Lock()
-			m.vms[rec.ID] = inst
-			m.mu.Unlock()
-			// Repopulate the network slot like running VMs do, so a paused
-			// sandbox deleted before its next resume can reclaim its slot.
-			// Resume's EnsureVMSlot is idempotent, so this is safe.
-			if inst.Namespace != "" && inst.IP != "" {
-				if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
-					log.Error().Err(err).Msg("reattach: restore paused VM network state failed")
-				}
-			}
-			log.Info().Msg("reattached paused VM")
+	// Phase A: reattach from BoltDB. Routed through reattachByID (singleflight)
+	// so this eager pass and any concurrent lazy request serialize per VM — a
+	// lazy load can't run reattachRecord for a vmID while the eager pass is mid
+	// stale-cleanup for the same one. reattachByID re-reads the record inside the
+	// flight, so a DestroyVM between the snapshot and here can't resurrect it.
+	for _, snap := range records {
+		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
+		// would otherwise misfire the stale-cleanup path against live VMs.
+		if ctx.Err() != nil {
+			break
+		}
+		if m.reattachByID(snap.ID, true) != nil {
 			reattached++
-			continue
-		}
-
-		// For running VMs, verify the systemd unit is still active.
-		if !isUnitActive(ctx, systemdUnitName(rec.ID)) {
-			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
-			// Kill the orphaned Firecracker process if it's still alive.
-			// Cold-booted VMs (from the old build path) were launched with
-			// Setsid: true and no systemd unit, so they survive vmd restarts
-			// as orphans holding TAP fds and contaminating the network pool.
-			if rec.PID > 0 {
-				if proc, err := os.FindProcess(rec.PID); err == nil {
-					if killErr := proc.Signal(syscall.SIGKILL); killErr == nil {
-						log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
-					}
-				}
-			}
-			m.state.Delete(rec.ID)
+		} else {
 			stale++
-			continue
 		}
-
-		// Verify the Firecracker API socket is actually reachable.
-		if rec.SocketPath != "" {
-			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
-				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — cleaning up")
-				m.state.Delete(rec.ID)
-				stale++
-				continue
-			}
-		}
-
-		// Reattach: add to in-memory map.
-		inst := toInstance(rec)
-
-		m.mu.Lock()
-		m.vms[rec.ID] = inst
-		m.mu.Unlock()
-
-		// Restore network manager state for this VM: slot tracking,
-		// devices map, host firewall rules (re-installed via idempotent
-		// AddVM in case the kernel rules were lost).
-		if inst.Namespace != "" && inst.IP != "" {
-			if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
-				log.Error().Err(err).Msg("reattach: restore network state failed")
-			}
-		}
-
-		m.persistState(inst)
-		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
-		reattached++
 	}
 
 	// Phase B: detect orphan systemd units not in BoltDB.
@@ -1617,15 +1570,201 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 		}
 	}
 
-	// Phase C: sweep host network namespaces (ns-N / veth-N) that do not
-	// correspond to any live BoltDB record. Template builds never touch
-	// BoltDB, so a crashed build always leaks; sandbox teardown can also
-	// race the kernel-level delete. Without this sweep the pre-allocated
-	// pool wastes startup retrying colliding slots and kernel state degrades
-	// over time. Re-reading records reflects Phase A's stale deletions.
+	// No broad re-sweep here. Startup already swept once before StartPool filled
+	// the pool; re-sweeping now would delete the pool's warm netns (which are not
+	// BoltDB records). Stale records deleted in Phase A free their own namespace
+	// inline (see reattachRecord), so a re-sweep isn't needed.
+
+	return reattached, stale
+}
+
+// reattachRecord rebuilds one VM's in-memory and network state from its BoltDB
+// reattachHook, when non-nil, is invoked at the start of every reattachRecord
+// call. Test-only seam for asserting that concurrent reattaches of the same VM
+// dedupe through the singleflight group. Always nil in production.
+var reattachHook func(vmID string)
+
+// record. Returns (nil, false) when cleanupStale deleted a dead record.
+//
+// cleanupStale must be false on the request path: the dead-VM check would SIGKILL
+// and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
+// sets it. Concurrent-safe: the map write is double-checked under the lock.
+func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
+	if reattachHook != nil {
+		reattachHook(rec.ID)
+	}
+	// Already present. A lazy load inserts optimistically (no liveness check), so
+	// a dead record it inserted isn't GC'd here — that's the reconciler's job
+	// (Drift 1/5 → markStale), deliberately, to avoid racing the request path.
+	m.mu.RLock()
+	if inst, ok := m.vms[rec.ID]; ok {
+		m.mu.RUnlock()
+		return inst, true
+	}
+	m.mu.RUnlock()
+
+	log := m.log.With().Str("vm_id", rec.ID).Logger()
+
+	// Running VMs must have a live systemd unit and a reachable API socket; a
+	// dead one is a stale record. Paused VMs legitimately have no unit — they
+	// were stopped at pause and wait for a resume — so they skip these checks.
+	if cleanupStale && rec.Status != StatusPaused {
+		if unitDefinitelyDead(ctx, systemdUnitName(rec.ID)) {
+			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
+			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
+			// they survive vmd restarts as orphans holding TAP fds — SIGKILL by PID.
+			if rec.PID > 0 {
+				if proc, err := os.FindProcess(rec.PID); err == nil {
+					if killErr := proc.Signal(syscall.SIGKILL); killErr == nil {
+						log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
+					}
+				}
+			}
+			m.state.Delete(rec.ID)
+			// Free this record's namespace/slot directly instead of a broad
+			// re-sweep (which would also delete the warm pool's netns).
+			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+			return nil, false
+		}
+		if rec.SocketPath != "" {
+			if _, statErr := os.Stat(rec.SocketPath); statErr != nil {
+				log.Warn().Str("socket", rec.SocketPath).Msg("VM unit active but socket missing — stopping and cleaning up")
+				// The unit is still active, so stop Firecracker before we forget
+				// the record and tear down its netns — otherwise it keeps running
+				// as an orphan burning CPU/RAM and holding TAP fds in a namespace
+				// we're about to delete out from under it.
+				if err := stopUnit(ctx, systemdUnitName(rec.ID)); err != nil {
+					log.Warn().Err(err).Msg("systemctl stop failed for socket-missing VM")
+				}
+				m.state.Delete(rec.ID)
+				m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+				return nil, false
+			}
+		}
+	}
+
+	// A running record whose netns was gone at startup had its slot relinquished
+	// for the pool to reuse. The FC is dead (a live one always has its netns), so
+	// this record is stale: reattaching it would bind its vmID onto the namespace
+	// the pool has since handed to a new sandbox, and a later firewall update or
+	// destroy for the stale vmID would then corrupt that live tenant. Refuse; the
+	// reconciler formally clears the record. Paused records are reserved, never
+	// relinquished, so a resumable VM is unaffected.
+	if rec.Status != StatusPaused && m.netMgr.IsRelinquished(rec.Namespace) {
+		log.Warn().Str("namespace", rec.Namespace).Msg("refusing reattach — slot relinquished at startup (stale record)")
+		// Clean the residue (veth/slot the pool hasn't reused) and drop the record
+		// here, so a DELETE that beats the background pass doesn't reach DestroyVM
+		// with no namespace and leak it. Cleanup skips teardown if ns-N was reused.
+		m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
+		m.state.Delete(rec.ID)
+		return nil, false
+	}
+
+	inst := toInstance(rec)
+
+	// Bail early if another caller (a request, or the background pass) already
+	// published this VM.
+	m.mu.RLock()
+	existing, present := m.vms[rec.ID]
+	m.mu.RUnlock()
+	if present {
+		return existing, true
+	}
+
+	// Restore network state (slot tracking, devices map, host firewall rules)
+	// BEFORE publishing to m.vms, so any concurrent getInstance that sees the
+	// map entry is guaranteed devices[vmID] is already populated — otherwise its
+	// UpdateSandboxNetwork/DestroyVM could race a half-restored VM. ReattachVM is
+	// idempotent, so a rare double restore (background pass and a request both
+	// reaching here) is harmless.
+	if inst.Namespace != "" && inst.IP != "" {
+		if err := m.netMgr.ReattachVM(rec.ID, inst.Namespace, inst.IP, inst.MACAddress); err != nil {
+			log.Error().Err(err).Msg("reattach: restore network state failed")
+		}
+	}
+
+	// Publish, re-checking under the write lock in case another caller won the
+	// race while we restored network state; if so, keep theirs.
+	m.mu.Lock()
+	if existing, ok := m.vms[rec.ID]; ok {
+		m.mu.Unlock()
+		return existing, true
+	}
+	m.vms[rec.ID] = inst
+	m.mu.Unlock()
+
+	// Commit only if a concurrent DestroyVM didn't delete the record during
+	// reattach (the gate is open, so deletes race the background pass); otherwise
+	// undo the in-memory reattach.
+	if rec.Status == StatusPaused {
+		if m.recordDeleted(rec.ID) {
+			m.undoReattach(rec.ID)
+			return nil, false
+		}
+		log.Info().Msg("reattached paused VM")
+	} else {
+		if !m.persistStateIfPresent(inst) {
+			m.undoReattach(rec.ID)
+			return nil, false
+		}
+		log.Info().Int("pid", inst.PID).Str("ip", inst.IP).Msg("reattached to running VM")
+	}
+	return inst, true
+}
+
+// lazyReattach loads a VM's record from BoltDB and reattaches it on demand, so
+// a request that arrives before the background startup pass has reached its VM
+// resolves it here instead of getting a spurious NotFound. Deduped per VM by
+// singleflight. Returns nil when the VM is unknown to this host (not in BoltDB).
+func (m *Manager) lazyReattach(vmID string) *VMInstance {
+	return m.reattachByID(vmID, false)
+}
+
+// reattachByID runs a single-flighted reattach for vmID. Routing BOTH the eager
+// startup pass and lazy request loads through the same singleflight group
+// serializes them per VM: only one reattachRecord runs for a given vmID at a
+// time, so the eager pass's stale-cleanup can't free a slot back to the pool
+// while a concurrent lazy load is mid-flight binding that VM's network state.
+//
+// cleanupStale is honored by whichever caller wins the flight; a joiner shares
+// that result. The reattach uses a detached, bounded context so a caller's
+// cancellation can't abort work another caller is waiting on. Returns nil when
+// the VM is unknown to this host or was cleaned up as stale.
+func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
+	if m.state == nil {
+		return nil
+	}
+	v, _, _ := m.reattachSF.Do(vmID, func() (any, error) {
+		m.mu.RLock()
+		inst, ok := m.vms[vmID]
+		m.mu.RUnlock()
+		if ok {
+			return inst, nil
+		}
+		rec, err := m.state.Get(vmID)
+		if err != nil || rec == nil {
+			return (*VMInstance)(nil), nil
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		got, _ := m.reattachRecord(ctx, *rec, cleanupStale)
+		return got, nil
+	})
+	inst, _ := v.(*VMInstance)
+	return inst
+}
+
+// SweepStartupOrphanNamespaces removes host network namespaces (ns-N / veth-N)
+// that no live BoltDB record claims — leaked by crashed template builds or a
+// teardown that raced the kernel delete. Reads BoltDB directly, so it is safe
+// to run before the eager reattach and before the network pool fills.
+func (m *Manager) SweepStartupOrphanNamespaces() {
+	if m.state == nil {
+		return
+	}
 	keepNs := make(map[string]bool)
-	if freshRecords, readErr := m.state.All(); readErr == nil {
-		for _, rec := range freshRecords {
+	if recs, err := m.state.All(); err == nil {
+		for _, rec := range recs {
 			if rec.Namespace != "" {
 				keepNs[rec.Namespace] = true
 			}
@@ -1634,8 +1773,68 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
 		m.log.Info().Int("swept", swept).Msg("sweep: removed orphan namespaces")
 	}
+}
 
-	return reattached, stale
+// ReserveStartupSlots bumps the network pool's slot high-water mark past every
+// slot an existing VM occupies, so StartPool can run before the backgrounded
+// per-VM reattach without the pool handing out a slot that collides with a
+// not-yet-reattached VM. One systemctl call for the whole fleet; otherwise just
+// parses slot indices, no kernel work.
+func (m *Manager) ReserveStartupSlots(ctx context.Context) {
+	if m.state == nil {
+		return
+	}
+	recs, err := m.state.All()
+	if err != nil {
+		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
+		return
+	}
+
+	// Authoritative liveness for running records, one call for the whole fleet.
+	// A running FC keeps its network namespace alive even if the /run/netns name
+	// was removed, so nsExists alone would wrongly relinquish a live VM's slot
+	// and hand it to the pool. Fail closed: if the list errors, treat every
+	// running record as live and reserve its slot rather than risk giving one
+	// away.
+	activeUnits, listErr := listActiveFirecrackerUnits(ctx)
+	if listErr != nil {
+		m.log.Warn().Err(listErr).Msg("startup slot reservation: active-unit list failed — reserving all running slots")
+	}
+	active := make(map[string]bool, len(activeUnits))
+	for _, id := range activeUnits {
+		active[id] = true
+	}
+
+	resumable, liveOnly := classifyStartupSlots(recs, active, listErr != nil)
+	m.netMgr.ReserveSlotsAbove(resumable, liveOnly)
+}
+
+// classifyStartupSlots splits records into slots reserved unconditionally
+// (resumable) vs. reserved only if their netns still exists (liveOnly), given
+// the set of active firecracker unit IDs. Pure, so the reserve/relinquish
+// policy is unit-testable without systemd or BoltDB.
+//
+//   - paused: reserved — keeps its slot across a reboot, rebuilt on resume.
+//   - running + active unit (or liveness unknown): reserved — the FC still owns
+//     its namespace even if its /run/netns name was removed, so its slot must
+//     not be relinquished to the pool.
+//   - running + no active unit: liveOnly — a dead FC; reserve only if its netns
+//     lingers, else relinquish the slot for reuse.
+func classifyStartupSlots(recs []VMRecord, active map[string]bool, livenessUnknown bool) (resumable, liveOnly []string) {
+	for _, rec := range recs {
+		if rec.Namespace == "" {
+			continue
+		}
+		switch {
+		case rec.Status == StatusPaused:
+			resumable = append(resumable, rec.Namespace)
+		case livenessUnknown || active[rec.ID]:
+			resumable = append(resumable, rec.Namespace)
+		default:
+			liveOnly = append(liveOnly, rec.Namespace)
+		}
+	}
+	return resumable, liveOnly
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,7 +1976,9 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 	inst, ok := m.vms[vmID]
 	m.mu.RUnlock()
 	if !ok {
-		return InstanceInfo{}, false
+		if inst = m.lazyReattach(vmID); inst == nil {
+			return InstanceInfo{}, false
+		}
 	}
 	inst.mu.RLock()
 	info := InstanceInfo{
@@ -1797,12 +1998,17 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 
 func (m *Manager) getInstance(vmID string) (*VMInstance, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	inst, ok := m.vms[vmID]
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "vm %s not found", vmID)
+	m.mu.RUnlock()
+	if ok {
+		return inst, nil
 	}
-	return inst, nil
+	// Not in the map — during the startup window it may not be reattached yet;
+	// load it on demand before declaring it gone.
+	if inst := m.lazyReattach(vmID); inst != nil {
+		return inst, nil
+	}
+	return nil, status.Errorf(codes.NotFound, "vm %s not found", vmID)
 }
 
 func (m *Manager) setStatus(vmID string, s VMStatus) {
@@ -1831,6 +2037,43 @@ func (m *Manager) persistState(inst *VMInstance) {
 	if err := m.state.Put(toRecord(inst)); err != nil {
 		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
 	}
+}
+
+// persistStateIfPresent persists inst only if its record still exists (atomic),
+// returning false when a concurrent DestroyVM deleted it — so the caller undoes
+// the reattach instead of resurrecting it. No store / write error → true.
+func (m *Manager) persistStateIfPresent(inst *VMInstance) bool {
+	if m.state == nil || isBuildVM(inst.ID) {
+		return true
+	}
+	wrote, err := m.state.PutIfPresent(toRecord(inst))
+	if err != nil {
+		m.log.Error().Err(err).Str("vm_id", inst.ID).Msg("failed to persist VM state to BoltDB")
+		return true
+	}
+	return wrote
+}
+
+// recordDeleted reports whether vmID's record is gone from the store (deleted
+// concurrently). False when there's no store or the read errors.
+func (m *Manager) recordDeleted(vmID string) bool {
+	if m.state == nil || isBuildVM(vmID) {
+		return false
+	}
+	present, err := m.state.Has(vmID)
+	return err == nil && !present
+}
+
+// undoReattach reverses an in-memory reattach when the record turns out to have
+// been deleted concurrently. It only forgets the in-memory entries: whoever
+// deleted the record (DestroyVM or the reconciler's markStale) already tore down
+// or recycled the slot, so a second physical teardown here would double-free it
+// or clobber the new owner of a recycled ns/veth.
+func (m *Manager) undoReattach(vmID string) {
+	m.mu.Lock()
+	delete(m.vms, vmID)
+	m.mu.Unlock()
+	m.netMgr.Forget(vmID)
 }
 
 // deleteState removes a VM record from BoltDB.

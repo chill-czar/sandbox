@@ -30,9 +30,34 @@ func touchNS(t *testing.T, dir, name string) {
 
 func newTestManager() *Manager {
 	return &Manager{
-		log:      zerolog.Nop(),
-		devices:  make(map[string]*VMNetInfo),
-		nextSlot: 1,
+		log:          zerolog.Nop(),
+		devices:      make(map[string]*VMNetInfo),
+		relinquished: make(map[int]bool),
+		inFlight:     make(map[int]bool),
+		nextSlot:     1,
+	}
+}
+
+func TestReserveSlotsAbove(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+	// liveOnly: ns-5 exists (reserved), ns-9 does NOT (stale running record —
+	// skipped so its slot stays free). bogus is unparseable.
+	touchNS(t, dir, "ns-5")
+	m.ReserveSlotsAbove(nil, []string{"ns-5", "bogus", "ns-9"})
+	if m.nextSlot != 6 {
+		t.Fatalf("nextSlot = %d, want 6 (past live ns-5; ns-9 skipped — no netns)", m.nextSlot)
+	}
+	// resumable: a paused VM's slot must be reserved even though its netns is
+	// gone (host reboot wiped it) — it rebuilds ns-20 on resume.
+	m.ReserveSlotsAbove([]string{"ns-20"}, nil)
+	if m.nextSlot != 21 {
+		t.Fatalf("nextSlot = %d, want 21 (paused ns-20 reserved despite missing netns)", m.nextSlot)
+	}
+	// A lower existing index must never pull nextSlot back down.
+	m.ReserveSlotsAbove([]string{"ns-3"}, []string{"ns-4"})
+	if m.nextSlot != 21 {
+		t.Fatalf("nextSlot = %d, want 21 (unchanged by lower index)", m.nextSlot)
 	}
 }
 
@@ -221,14 +246,16 @@ func TestCleanupVMOrNamespace_EmptyAndInvalidNamespaceNoop(t *testing.T) {
 	}
 }
 
-func TestCleanupVMOrNamespace_MissingNamespaceNoop(t *testing.T) {
-	withTestNetnsDir(t) // ns-5 intentionally not touched → nsExists is false
+func TestCleanupVMOrNamespace_MissingNamespaceStillReclaims(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 intentionally not touched → netns already gone
 	m := newTestManager()
 
+	// The host-side veth-N can outlive its netns, so cleanup must still tear it
+	// down and reclaim the slot even when the namespace itself is already gone.
 	m.CleanupVMOrNamespace("vm-u", "ns-5")
 
-	if len(m.freeSlots) != 0 {
-		t.Errorf("freeSlots = %v, want [] (namespace gone, nothing to reclaim)", m.freeSlots)
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5] (slot reclaimed despite missing netns)", m.freeSlots)
 	}
 }
 
@@ -241,5 +268,80 @@ func TestCleanupVMOrNamespace_ReclaimsUntrackedSlot(t *testing.T) {
 
 	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
 		t.Errorf("freeSlots = %v, want [5] (slot reclaimed)", m.freeSlots)
+	}
+}
+
+// A slot relinquished at startup (running record whose netns was gone) that the
+// pool has since reused — ns-5 exists again — must NOT be torn down or reclaimed
+// by the stale record's deferred cleanup, or it corrupts the new sandbox.
+func TestCleanupVMOrNamespace_RelinquishedReusedSlotSkipped(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	// Startup: running record at ns-5 has no netns → relinquished.
+	m.ReserveSlotsAbove(nil, []string{"ns-5"})
+	// Pool reuses slot 5 for a new sandbox (recreates the netns).
+	touchNS(t, dir, "ns-5")
+
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (reused slot must not be reclaimed)", m.freeSlots)
+	}
+}
+
+// IsRelinquished reports true only for slots freed at startup (running record
+// with no netns), so the reattach path can refuse to bind a stale vmID onto a
+// slot the pool may have reused.
+func TestIsRelinquished(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	m := newTestManager()
+
+	touchNS(t, dir, "ns-7") // ns-7 live → reserved, not relinquished
+	m.ReserveSlotsAbove(nil, []string{"ns-7", "ns-5"})
+
+	if !m.IsRelinquished("ns-5") {
+		t.Error("ns-5 (running, no netns) must be relinquished")
+	}
+	if m.IsRelinquished("ns-7") {
+		t.Error("ns-7 (live netns) must not be relinquished")
+	}
+	if m.IsRelinquished("ns-99") {
+		t.Error("ns-99 (never seen) must not be relinquished")
+	}
+	if m.IsRelinquished("bogus") {
+		t.Error("unparseable namespace must not be relinquished")
+	}
+}
+
+// A relinquished slot the pool has CLAIMED but not yet built (ns-N doesn't
+// exist yet, but it's marked in-flight) must NOT be reclaimed by a stale-record
+// cleanup — otherwise the slot is double-owned and later handed out twice.
+func TestCleanupVMOrNamespace_RelinquishedInFlightSlotSkipped(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 intentionally absent: allocator is mid-setupSlot
+	m := newTestManager()
+	m.ReserveSlotsAbove(nil, []string{"ns-5"}) // ns-5 relinquished at startup
+	m.mu.Lock()
+	m.inFlight[5] = true // pool claimed slot 5, before setupSlot creates ns-5
+	m.mu.Unlock()
+
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 0 {
+		t.Errorf("freeSlots = %v, want [] (in-flight slot must not be reclaimed)", m.freeSlots)
+	}
+}
+
+// A relinquished slot the pool did NOT reuse — netns still gone — is safely
+// reclaimed (and any leftover host veth removed) by the deferred cleanup.
+func TestCleanupVMOrNamespace_RelinquishedUnusedSlotReclaimed(t *testing.T) {
+	withTestNetnsDir(t) // ns-5 never recreated → still gone
+	m := newTestManager()
+
+	m.ReserveSlotsAbove(nil, []string{"ns-5"})
+	m.CleanupVMOrNamespace("stale-vm", "ns-5")
+
+	if len(m.freeSlots) != 1 || m.freeSlots[0] != 5 {
+		t.Errorf("freeSlots = %v, want [5] (unused relinquished slot reclaimed)", m.freeSlots)
 	}
 }
