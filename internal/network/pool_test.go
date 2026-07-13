@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func newTestPool(t *testing.T, m *Manager) *Pool {
 		stopCh:             make(chan struct{}),
 		verifyPollInterval: time.Millisecond,
 		verifyMaxWait:      50 * time.Millisecond,
+		resetSem:           make(chan struct{}, resetTapConcurrency),
 	}
 	t.Cleanup(func() {
 		select {
@@ -165,6 +167,75 @@ func TestPoolReturn_ResetsTapBeforeRecycling(t *testing.T) {
 	}
 	if got, _ := resetNS.Load().(string); got != "ns-1" {
 		t.Errorf("resetTap called with ns %q, want ns-1", got)
+	}
+}
+
+// TestPoolReturn_BoundsConcurrentTapResets: a mass return drives many verify
+// goroutines at once, but at most resetTapConcurrency tap rebuilds may be in
+// flight — the rest queue on the semaphore instead of fork-storming the host.
+func TestPoolReturn_BoundsConcurrentTapResets(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+
+	var cur, peak atomic.Int32
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error {
+		c := cur.Add(1)
+		for {
+			p := peak.Load()
+			if c <= p || peak.CompareAndSwap(p, c) {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+		cur.Add(-1)
+		return nil
+	})
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	p.recycled = make(chan *preallocSlot, 64) // don't trip the overflow skip
+
+	const n = 32
+	for i := 0; i < n; i++ {
+		ns := fmt.Sprintf("ns-%d", i)
+		touchNS(t, dir, ns)
+		m.assignSlotLocked(i, "old-vm")
+		p.Return(&preallocSlot{idx: i, info: &VMNetInfo{Namespace: ns}, vethName: fmt.Sprintf("veth-%d", i)})
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-p.recycled:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d/%d slots recycled", i, n)
+		}
+	}
+	if got := peak.Load(); got > resetTapConcurrency {
+		t.Errorf("concurrent tap resets peaked at %d, want <= %d", got, resetTapConcurrency)
+	}
+}
+
+// TestPoolReturn_ReleasesResetTokenOnPanic: a panicking rebuild must release
+// its semaphore token — Return's goroutine recovers panics, so a leaked token
+// would permanently shrink the reset window.
+func TestPoolReturn_ReleasesResetTokenOnPanic(t *testing.T) {
+	dir := withTestNetnsDir(t)
+	touchNS(t, dir, "ns-1")
+	stubPidsInNs(t, func(string) ([]int, bool) { return nil, true })
+	stubResetTap(t, func(_ *Manager, _ context.Context, _ string) error { panic("rebuild blew up") })
+
+	m := newTestManager()
+	p := newTestPool(t, m)
+	p.resetTapOnRecycle = true
+	m.assignSlotLocked(1, "old-vm")
+
+	p.Return(&preallocSlot{idx: 1, info: &VMNetInfo{Namespace: "ns-1"}, vethName: "veth-1"})
+
+	// Wait for the verify goroutine (it holds a wg slot through the panic
+	// recovery) so the assertion — and the test's stub cleanup — can't race it.
+	p.wg.Wait()
+	if got := len(p.resetSem); got != 0 {
+		t.Errorf("resetSem holds %d token(s) after a panicking rebuild, want 0", got)
 	}
 }
 

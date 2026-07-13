@@ -48,6 +48,9 @@ type Pool struct {
 
 	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
 	resetTapOnRecycle bool
+	// resetSem bounds concurrent tap rebuilds so a mass delete's returns can't
+	// fork-storm the kernel's netlink lock.
+	resetSem chan struct{}
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
@@ -79,6 +82,14 @@ const (
 	// TimeoutStopSec=10 (systemd's own worst case for a unit that ignores
 	// SIGTERM) plus margin for kernel teardown under host I/O contention.
 	defaultVerifyMaxWait = 20 * time.Second
+	// resetTapConcurrency caps in-flight tap rebuilds (see Pool.resetSem);
+	// rebuilds are short once uncontended, so a small window drains a backlog
+	// quickly.
+	resetTapConcurrency = 8
+	// resetTapTimeout bounds one batched rebuild — a healthy one takes well
+	// under a second, and a tight bound keeps a stalled backlog (and Stop)
+	// from dragging.
+	resetTapTimeout = 3 * time.Second
 )
 
 // StartPool creates the network slot pool and fills it in the background, so
@@ -103,6 +114,7 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 		recycled:          make(chan *preallocSlot, recycleSize),
 		stopCh:            make(chan struct{}),
 		resetTapOnRecycle: cfg.ResetTapOnRecycle,
+		resetSem:          make(chan struct{}, resetTapConcurrency),
 	}
 	m.pool = p
 
@@ -238,21 +250,42 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		}
 	}
 
-	// A full recycle pool means this slot is headed for teardown anyway — skip
-	// the tap rebuild rather than pay it for a slot about to be destroyed
-	// (mass deletes overflow the pool by design). Racy but safe: the send
-	// below still has a default arm.
-	if p.resetTapOnRecycle && len(p.recycled) == cap(p.recycled) {
-		p.cleanup(slot)
-		return
-	}
-
 	// Process-free doesn't prove tap0's fd is released, so rebuild the tap
 	// before recycling; if it can't be rebuilt, tear down instead.
 	if p.resetTapOnRecycle {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := resetTapFunc(p.mgr, ctx, ns)
-		cancel()
+		// A full recycle pool means this slot is headed for teardown anyway —
+		// skip the rebuild rather than pay it for a slot about to be destroyed
+		// (mass deletes overflow the pool by design). Racy but safe: the send
+		// below still has a default arm.
+		if len(p.recycled) == cap(p.recycled) {
+			p.cleanup(slot)
+			return
+		}
+		// The semaphore is acquired before the deadline starts, so queueing
+		// behind a backlog doesn't eat into a rebuild's own budget.
+		select {
+		case p.resetSem <- struct{}{}:
+		case <-p.stopCh:
+			p.cleanup(slot)
+			return
+		}
+		poolFull, err := func() (bool, error) {
+			// Deferred so a panicking rebuild can't leak the token — Return's
+			// goroutine recovers panics, and a leaked token outlives them.
+			defer func() { <-p.resetSem }()
+			// Recheck after queueing: a mass return can fill the pool while
+			// this slot waited, and a doomed slot shouldn't pay for a rebuild.
+			if len(p.recycled) == cap(p.recycled) {
+				return true, nil
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), resetTapTimeout)
+			defer cancel()
+			return false, resetTapFunc(p.mgr, ctx, ns)
+		}()
+		if poolFull {
+			p.cleanup(slot)
+			return
+		}
 		if err != nil {
 			p.log.Error().Err(err).Str("namespace", ns).Int("slot", slot.idx).
 				Msg("pool: tap reset failed on recycle — tearing down instead of recycling")
