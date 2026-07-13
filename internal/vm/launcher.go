@@ -217,12 +217,11 @@ func unescapeMountinfo(s string) string {
 	return b.String()
 }
 
-// StartMountCountSampler periodically logs the host mount-table size so the
-// O(1)-launch invariant — mount count should stay roughly flat, not grow with
-// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
-func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+// startSampler runs fn on a ticker until ctx is done. Shared scaffold for the
+// periodic host gauges below.
+func (m *Manager) startSampler(ctx context.Context, name string, every time.Duration, fn func()) {
 	go func() {
-		defer sentrylog.Recover("mount-count sampler")
+		defer sentrylog.Recover(name)
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
@@ -230,13 +229,34 @@ func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duratio
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				total, nsfs := hostMountCounts()
-				m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
-					Msg("host mount table")
-				m.revalidateLauncher(ctx)
+				fn()
 			}
 		}
 	}()
+}
+
+// StartMountCountSampler periodically logs the host mount-table size so the
+// O(1)-launch invariant — mount count should stay roughly flat, not grow with
+// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
+func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
+	m.startSampler(ctx, "mount-count sampler", every, func() {
+		total, nsfs := hostMountCounts()
+		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Msg("host mount table")
+		m.revalidateLauncher(ctx)
+	})
+}
+
+// StartNetnsLeakSampler periodically logs the host's network-namespace counts.
+// netns_orphaned (namespaces with no owning slot) is the leak signal: sustained
+// growth means teardown is leaking. One /run/netns readdir per tick.
+func (m *Manager) StartNetnsLeakSampler(ctx context.Context, every time.Duration) {
+	m.startSampler(ctx, "netns-leak sampler", every, func() {
+		netnsTotal, ownedSlots, orphaned := m.netMgr.NetnsStats()
+		m.log.Info().Int("netns_total", netnsTotal).Int("owned_slots", ownedSlots).
+			Int("netns_orphaned", orphaned).
+			Msg("netns leak gauge")
+	})
 }
 
 // revalidateLauncher re-syncs launcherReady with the live pin each tick: drop to

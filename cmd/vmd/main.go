@@ -523,10 +523,15 @@ func main() {
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:     netPoolFresh,
-		RecycleSize: netPoolRecycle,
+		NewSize:           netPoolFresh,
+		RecycleSize:       netPoolRecycle,
+		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+
+	// Leak gauge for network namespaces — independent of the launcher path, and
+	// started after StartPool so its first read observes an initialized pool.
+	mgr.StartNetnsLeakSampler(ctx, time.Minute)
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively

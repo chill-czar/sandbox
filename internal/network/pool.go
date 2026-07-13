@@ -20,6 +20,9 @@ type PoolConfig struct {
 	// setup (namespace, veth, TAP, nftables are already configured).
 	// Default: 100.
 	RecycleSize int
+	// ResetTapOnRecycle recreates a returned slot's tap0 before it is made
+	// claimable again (see verifyAndRecycle). Off by default.
+	ResetTapOnRecycle bool
 }
 
 // Pool pre-allocates network namespaces, veth pairs, TAP devices, and
@@ -42,6 +45,9 @@ type Pool struct {
 	// tests override these to run the timeout path without a real 20s wait.
 	verifyPollInterval time.Duration
 	verifyMaxWait      time.Duration
+
+	// resetTapOnRecycle recreates tap0 before a returned slot is recycled.
+	resetTapOnRecycle bool
 }
 
 // preallocSlot holds a fully configured network namespace ready to be
@@ -56,6 +62,10 @@ type preallocSlot struct {
 // pidsInNsFunc is a seam over pidsInNs so tests can simulate a namespace
 // that's still occupied (or clear) without a real kernel netns/process.
 var pidsInNsFunc = pidsInNs
+
+// resetTapFunc is a seam over Manager.resetTap so tests can drive the
+// recycle-vs-teardown decision without building a real netns + tap device.
+var resetTapFunc = (*Manager).resetTap
 
 const (
 	// defaultVerifyPollInterval trades a small amount of slot-reuse latency
@@ -86,16 +96,18 @@ func (m *Manager) StartPool(ctx context.Context, cfg PoolConfig) *Pool {
 	}
 
 	p := &Pool{
-		mgr:      m,
-		log:      m.log.With().Str("component", "net_pool").Logger(),
-		newSize:  newSize,
-		fresh:    make(chan *preallocSlot, newSize),
-		recycled: make(chan *preallocSlot, recycleSize),
-		stopCh:   make(chan struct{}),
+		mgr:               m,
+		log:               m.log.With().Str("component", "net_pool").Logger(),
+		newSize:           newSize,
+		fresh:             make(chan *preallocSlot, newSize),
+		recycled:          make(chan *preallocSlot, recycleSize),
+		stopCh:            make(chan struct{}),
+		resetTapOnRecycle: cfg.ResetTapOnRecycle,
 	}
 	m.pool = p
 
-	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).Msg("network pool starting (filling in background)")
+	p.log.Info().Int("target", newSize).Int("recycle_cap", recycleSize).
+		Bool("reset_tap_on_recycle", p.resetTapOnRecycle).Msg("network pool starting (filling in background)")
 	p.wg.Add(1)
 	go func() { defer sentrylog.Recover("netpool-refill"); p.refillLoop(ctx) }()
 
@@ -221,6 +233,29 @@ func (p *Pool) verifyAndRecycle(slot *preallocSlot) {
 		select {
 		case <-time.After(pollInterval):
 		case <-p.stopCh:
+			p.cleanup(slot)
+			return
+		}
+	}
+
+	// A full recycle pool means this slot is headed for teardown anyway — skip
+	// the tap rebuild rather than pay it for a slot about to be destroyed
+	// (mass deletes overflow the pool by design). Racy but safe: the send
+	// below still has a default arm.
+	if p.resetTapOnRecycle && len(p.recycled) == cap(p.recycled) {
+		p.cleanup(slot)
+		return
+	}
+
+	// Process-free doesn't prove tap0's fd is released, so rebuild the tap
+	// before recycling; if it can't be rebuilt, tear down instead.
+	if p.resetTapOnRecycle {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := resetTapFunc(p.mgr, ctx, ns)
+		cancel()
+		if err != nil {
+			p.log.Error().Err(err).Str("namespace", ns).Int("slot", slot.idx).
+				Msg("pool: tap reset failed on recycle — tearing down instead of recycling")
 			p.cleanup(slot)
 			return
 		}
