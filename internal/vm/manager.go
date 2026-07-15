@@ -860,13 +860,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir string) (snapsh
 	// record must reach Paused (a retry against a Running record would
 	// re-diff an already-consumed dirty bitmap and destroy the overlay).
 	//
-	// Bound the WHOLE stop path (both attempts + dead-check) to the caller's
-	// deadline: the control plane caps the pause RPC at ~30s and reverts the
-	// DB row to active on timeout, so a stop that finishes after that would
-	// leave DB-active-but-VM-stopped drift. If the stop can't finish in the
-	// remaining budget the straggler unit is reclaimed by the reconciler —
-	// self-healing, unlike the drift. This is why the path shares the
-	// caller's budget rather than taking fresh detached ones.
+	// Bound the stop path (both attempts + dead-check) to the caller's
+	// deadline so the handler can't run long past the ~30s pause RPC cap
+	// (stopUnit's expiry settle may probe ≤2s past it — bounded, and it only
+	// affects the log below, never what gets persisted). A timed-out pause
+	// converges anyway: the control plane retries pause to paused rather than
+	// reverting, and a straggler unit is reclaimed by the reconciler.
 	unit := systemdUnitName(vmID)
 	stopCtx, stopCancel := context.WithTimeout(ctx, stopUnitBudget)
 	if err := stopUnit(stopCtx, unit); err != nil {
@@ -1279,7 +1278,7 @@ func (m *Manager) VerifySnapshot(ctx context.Context, vmID string) (string, erro
 	if _, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace); err != nil {
 		return "", fmt.Errorf("start firecracker for verify: %w", err)
 	}
-	defer func() { _ = stopUnit(context.Background(), systemdUnitName(vmID)) }()
+	defer func() { _ = stopUnitWithBudget(context.Background(), systemdUnitName(vmID)) }()
 
 	if err := LoadSnapshotNoResume(socketPath, snapshotPath, memPath, "eth0", tapDevice, ""); err != nil {
 		return "", err
@@ -2584,15 +2583,24 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		warmup = time.Duration(m.cfg.UffdRecordMaxSeconds) * time.Second
 	}
 
+	// Bounded, not Background: an unbounded destroy could pin the shared
+	// systemd job lock behind a wedged PID1 and queue every stop on the host.
+	// The clock starts at the destroy, not before the warmup sleep.
+	destroyRecordingVM := func() error {
+		dctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		return m.DestroyVM(dctx, inst.ID, true)
+	}
+
 	if recordWarmup(ctx, warmup) == warmupCancelled {
-		if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+		if err := destroyRecordingVM(); err != nil {
 			m.log.Warn().Err(err).Str("template_vm", vmID).
 				Msg("destroy after cancelled recording warmup failed; reconciler will clean up")
 		}
 		return ctx.Err()
 	}
 
-	if err := m.DestroyVM(context.Background(), inst.ID, true); err != nil {
+	if err := destroyRecordingVM(); err != nil {
 		return fmt.Errorf("destroy recording VM: %w", err)
 	}
 
@@ -2835,6 +2843,14 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 // unitMainPID returns the systemd MainPID for a VM's unit, or 0 when it can't
 // be resolved or the unit has no running process.
 func (m *Manager) unitMainPID(ctx context.Context, vmID string) int {
+	if val, notLoaded, ok := sdbusUnitProperty(ctx, systemdUnitName(vmID), "Service", "MainPID"); ok {
+		if notLoaded {
+			return 0 // unit gone == no process, definitively
+		}
+		if pid, isU32 := val.(uint32); isU32 {
+			return int(pid)
+		}
+	}
 	out, err := exec.CommandContext(ctx, "systemctl", "show", "--property=MainPID", "--value", systemdUnitName(vmID)).Output()
 	if err != nil {
 		return 0
