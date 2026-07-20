@@ -30,9 +30,11 @@ type stubVMD struct {
 	pauseFn          func(ctx context.Context, id, snapshotDir string) (string, string, error)
 	resumeFn         func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
+	restorePolicyFn  func(access string, ports map[int32]struct{}, revision int64)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
 	deleteSnapsFn    func(ctx context.Context, id string) error
 	updateNetworkFn  func(ctx context.Context, id string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	updatePreviewFn  func(ctx context.Context, id, access string, ports map[int32]struct{}, revision int64) error
 	injectEnvFn      func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn        func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
 }
@@ -56,7 +58,10 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _ string, _ map[string]string) (string, uint32, uint32, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, error) {
+	if s.restorePolicyFn != nil {
+		s.restorePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
+	}
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
 		return ip, 1, 1024, err
@@ -89,6 +94,12 @@ func (s *stubVMD) ListDir(ctx context.Context, id, path string) ([]vmdclient.Dir
 func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, id string, allowed, denied, domains []string) error {
 	if s.updateNetworkFn != nil {
 		return s.updateNetworkFn(ctx, id, allowed, denied, domains)
+	}
+	return nil
+}
+func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, access string, ports map[int32]struct{}, revision int64) error {
+	if s.updatePreviewFn != nil {
+		return s.updatePreviewFn(ctx, id, access, ports, revision)
 	}
 	return nil
 }
@@ -187,8 +198,31 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[21].(*int32) = s.DiskMib
 		*dest[22].(**int32) = s.AutoDeleteSeconds
 		*dest[23].(*pgtype.Timestamptz) = s.AutoDeleteAt
+		*dest[24].(*string) = s.PreviewAccess
+		*dest[25].(*int64) = s.PreviewPolicyRevision
 		return nil
 	}}
+}
+
+func hostRow(h db.Host) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*string) = h.ID
+		*dest[1].(*string) = h.VmdAddr
+		*dest[2].(*string) = h.ProxyAddr
+		*dest[3].(*string) = h.Region
+		*dest[4].(*string) = h.Status
+		*dest[5].(*int32) = h.CapacityMemoryMib
+		*dest[6].(*int32) = h.CapacityVcpus
+		*dest[7].(*pgtype.Timestamptz) = h.LastHeartbeatAt
+		*dest[8].(*time.Time) = h.CreatedAt
+		*dest[9].(*time.Time) = h.UpdatedAt
+		*dest[10].(*[]string) = h.Capabilities
+		return nil
+	}}
+}
+
+func previewCapableHostRow() *mockRow {
+	return hostRow(db.Host{ID: "default", Capabilities: []string{"preview_ports_v1"}})
 }
 
 // templateRow returns a mockRow that populates a Template from a Scan call
@@ -1498,15 +1532,23 @@ func TestCreateSandbox_Success(t *testing.T) {
 	// Even though the request omits from_template, the handler defaults it
 	// to "superserve/base" and routes through RestoreSnapshot. The stub returns
 	// VMD-reported resources (1 vcpu, 1024 MiB — stubVMD's defaults).
-	vmd := &stubVMD{}
+	var restoredAccess string
+	var restoredPorts map[int32]struct{}
+	var restoredRevision int64
+	vmd := &stubVMD{restorePolicyFn: func(access string, ports map[int32]struct{}, revision int64) {
+		restoredAccess, restoredPorts, restoredRevision = access, ports, revision
+	}}
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
-					CreatedAt: time.Now(),
+					CreatedAt: time.Now(), PreviewAccess: "public",
 				})
 			}
 			if strings.Contains(sql, "FROM template") {
@@ -1535,6 +1577,12 @@ func TestCreateSandbox_Success(t *testing.T) {
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want active", body["status"])
 	}
+	if body["preview_access"] != "public" {
+		t.Errorf("preview_access = %q, want public", body["preview_access"])
+	}
+	if restoredAccess != "public" || restoredPorts != nil || restoredRevision != 0 {
+		t.Errorf("restored preview policy = (%q, %#v, %d), want (public, nil, 0)", restoredAccess, restoredPorts, restoredRevision)
+	}
 	// Resources should reflect what VMD reported, not the initial INSERT placeholders.
 	if v := body["vcpu_count"].(float64); v == 0 {
 		t.Error("vcpu_count is 0 — VMD's reported value was not propagated to the response")
@@ -1559,6 +1607,9 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -1607,6 +1658,9 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -1682,6 +1736,9 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return errorRow(quotaErr)
 			}
@@ -1728,6 +1785,9 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "sb",
@@ -2110,6 +2170,9 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				// Positional args (0-indexed): id, team_id, name, status,
 				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.
@@ -2170,6 +2233,9 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "FROM host WHERE id") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				// Positional args (0-indexed): id, team_id, name, status,
 				// vcpu, mem, host_id, ip, pid, snapshot_id, timeout, metadata.

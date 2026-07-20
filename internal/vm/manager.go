@@ -104,6 +104,13 @@ type VMInstance struct {
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
 
+	// PreviewAccess and PreviewPorts are the data-plane publication policy.
+	// Empty/legacy_public preserves historical all-port routing; public requires
+	// membership in the allowlist. The revision rejects stale full-set pushes.
+	PreviewAccess         string
+	PreviewPorts          map[int32]struct{}
+	PreviewPolicyRevision int64
+
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
 	// Diff overlay (mem.diff) against this base, and resume loads layered
@@ -1468,8 +1475,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
 
 // templateRestoreAge returns seconds since this host last completed a restore of
@@ -1531,7 +1539,8 @@ func psiSomeAvg10(path string) float64 {
 // recording, in which case the in-firecracker UFFD handler writes each served
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID, recordToPath string,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1631,6 +1640,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		MemFilePath:  memPath,
 		TeamID:       teamID,
 		OwnerID:      ownerID,
+
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          clonePreviewPorts(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -2391,6 +2404,9 @@ type InstanceInfo struct {
 	CreatedAt time.Time
 	TeamID    string
 	OwnerID   string
+
+	PreviewAccess string
+	PreviewPorts  map[int32]struct{}
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2413,9 +2429,59 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		CreatedAt: inst.CreatedAt,
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
+
+		PreviewAccess: inst.PreviewAccess,
+		PreviewPorts:  clonePreviewPorts(inst.PreviewPorts),
 	}
 	inst.mu.RUnlock()
 	return info, true
+}
+
+func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int32]struct{}, len(in))
+	for port := range in {
+		out[port] = struct{}{}
+	}
+	return out
+}
+
+// UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
+// record. Revisions are monotonic; stale/reordered snapshots are harmlessly
+// ignored so they cannot reopen an unpublished port.
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return err
+	}
+	inst.mu.Lock()
+	if revision <= inst.PreviewPolicyRevision {
+		inst.mu.Unlock()
+		return nil
+	}
+	nextPorts := clonePreviewPorts(previewPorts)
+	// Keep the instance lock through persistence. Otherwise two concurrent
+	// RPCs can apply revisions in order but race their BoltDB writes in reverse,
+	// resurrecting the stale policy after a vmd restart. Persist the intended
+	// record before advancing memory so a failed write leaves the old revision
+	// retryable instead of acknowledging a policy that a restart would lose.
+	if m.state != nil && !isBuildVM(inst.ID) {
+		record := toRecordLocked(inst)
+		record.PreviewAccess = previewAccess
+		record.PreviewPorts = previewPortsToRecord(nextPorts)
+		record.PreviewPolicyRevision = revision
+		if err := m.state.Put(record); err != nil {
+			inst.mu.Unlock()
+			return fmt.Errorf("persist preview policy: %w", err)
+		}
+	}
+	inst.PreviewAccess = previewAccess
+	inst.PreviewPorts = nextPorts
+	inst.PreviewPolicyRevision = revision
+	inst.mu.Unlock()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,7 +2729,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", "", nil, 0, outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}

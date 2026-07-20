@@ -295,6 +295,8 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
+	// Data-plane capabilities advertised by the currently running vmd/proxy build.
+	Capabilities []string `json:"capabilities"`
 }
 
 type NetFlow struct {
@@ -435,6 +437,9 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+	// Preview routing mode: legacy_public routes every listening port; public routes only explicitly published ports.
+	PreviewAccess         string `json:"preview_access"`
+	PreviewPolicyRevision int64  `json:"preview_policy_revision"`
 }
 
 type SandboxActiveInterval struct {
@@ -456,6 +461,14 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+// Public preview ports explicitly routable for a strict sandbox.
+type SandboxPublishedPort struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Port      int32     `json:"port"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type SandboxRevocation struct {

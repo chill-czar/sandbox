@@ -26,6 +26,7 @@ WHERE id = $1;
 -- automatic recovery path after a transient network outage.
 UPDATE host
 SET last_heartbeat_at = now(),
+    capabilities = $2,
     status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
     updated_at = now()
 WHERE id = $1

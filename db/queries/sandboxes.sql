@@ -366,6 +366,37 @@ UPDATE sandbox
 SET metadata = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
+-- name: UpdateSandboxPreviewAccess :execrows
+UPDATE sandbox
+SET preview_access = $2, updated_at = now()
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+
+-- name: BumpPreviewPolicyRevision :one
+-- This row update is the per-sandbox serialization point for publication
+-- mutations. Call it first inside the same transaction as the mutation and
+-- authoritative allowlist read; vmd uses the returned generation to reject
+-- stale full-set pushes.
+UPDATE sandbox
+SET preview_policy_revision = preview_policy_revision + 1, updated_at = now()
+WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
+RETURNING preview_policy_revision;
+
+-- name: ListPublishedPorts :many
+SELECT port FROM sandbox_published_port
+WHERE sandbox_id = $1
+ORDER BY port;
+
+-- name: PublishPort :one
+-- Idempotent: re-publishing keeps the same resource and refreshes updated_at.
+INSERT INTO sandbox_published_port (sandbox_id, port)
+VALUES ($1, $2)
+ON CONFLICT (sandbox_id, port) DO UPDATE SET updated_at = now()
+RETURNING port;
+
+-- name: UnpublishPort :execrows
+DELETE FROM sandbox_published_port
+WHERE sandbox_id = $1 AND port = $2;
+
 -- name: GetSandboxNetworkConfig :one
 SELECT network_config FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;

@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -573,7 +574,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
+			previewPorts, portsErr := h.loadPreviewPorts(c.Request.Context(), sandboxID)
+			if portsErr != nil {
+				log.Error().Err(portsErr).Str("sandbox_id", sandboxID.String()).Msg("load published ports for resume failed")
+				revertToPaused()
+				respondError(c, ErrInternal)
+				return false
+			}
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, previewPorts, sandbox.PreviewPolicyRevision, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -1166,6 +1174,10 @@ type createSandboxRequest struct {
 	// Secrets binds team-stored credentials to env-var names; the agent sees a
 	// per-binding proxy token, swapped for the real value at egress.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// PreviewAccess is currently only "public": new sandboxes default to the
+	// strict explicitly-published-port model. legacy_public is migration-only.
+	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -1184,10 +1196,11 @@ type sandboxResponse struct {
 	// AutoDeleteAt is the concrete deletion deadline. Present only while the
 	// sandbox is paused with an auto-delete window configured, so clients can
 	// see exactly when the sandbox will be removed.
-	AutoDeleteAt *time.Time             `json:"auto_delete_at,omitempty"`
-	Network      *networkConfigRequest  `json:"network,omitempty"`
-	Metadata     map[string]string      `json:"metadata"`
-	Secrets      []sandboxSecretBinding `json:"secrets,omitempty"`
+	AutoDeleteAt  *time.Time             `json:"auto_delete_at,omitempty"`
+	Network       *networkConfigRequest  `json:"network,omitempty"`
+	Metadata      map[string]string      `json:"metadata"`
+	Secrets       []sandboxSecretBinding `json:"secrets,omitempty"`
+	PreviewAccess string                 `json:"preview_access"`
 }
 
 // sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
@@ -1201,13 +1214,14 @@ type sandboxSecretBinding struct {
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
-		ID:        formatSandboxID(s.ID),
-		Name:      s.Name,
-		Status:    string(s.Status),
-		VcpuCount: s.VcpuCount,
-		MemoryMib: s.MemoryMib,
-		CreatedAt: s.CreatedAt,
-		Metadata:  decodeMetadata(s.Metadata),
+		ID:            formatSandboxID(s.ID),
+		Name:          s.Name,
+		Status:        string(s.Status),
+		VcpuCount:     s.VcpuCount,
+		MemoryMib:     s.MemoryMib,
+		CreatedAt:     s.CreatedAt,
+		Metadata:      decodeMetadata(s.Metadata),
+		PreviewAccess: s.PreviewAccess,
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -1529,6 +1543,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validatePreviewAccess(req.PreviewAccess); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
 	if err := validateSecretsRefs(req.Secrets); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -1640,6 +1658,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		hostID = "default"
 	}
 	SetTelemetryHostID(c, hostID)
+
+	// Every new sandbox starts strict, so it can only be placed on a host that
+	// advertises publication enforcement. This happens before DB/VM creation.
+	if !h.requireHostPreviewPorts(c, hostID) {
+		return
+	}
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
@@ -1782,7 +1806,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), preview.AccessPublic, nil, 0, req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -2292,6 +2316,7 @@ type patchSandboxRequest struct {
 	Metadata          map[string]string     `json:"metadata,omitempty"`
 	AutoDeleteSeconds optionalInt32         `json:"auto_delete_seconds,omitempty"`
 	TimeoutSeconds    optionalInt32         `json:"timeout_seconds,omitempty"`
+	PreviewAccess     *string               `json:"preview_access,omitempty"`
 }
 
 // optionalInt32 is a tri-state JSON field: absent (Set=false), explicit null
@@ -2340,8 +2365,12 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	// Reject empty patches.
-	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set {
-		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds)", http.StatusBadRequest)
+	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set && body.PreviewAccess == nil {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds, preview_access)", http.StatusBadRequest)
+		return
+	}
+	if err := validatePreviewAccess(body.PreviewAccess); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -2497,7 +2526,42 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		}
 	}
 
+	if body.PreviewAccess != nil {
+		if !h.applyPreviewAccessPatch(c, sandbox, teamID) {
+			return
+		}
+	}
+
 	c.Status(http.StatusNoContent)
+}
+
+func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID) bool {
+	if !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		return false
+	}
+	sandbox.PreviewAccess = preview.AccessPublic
+	var updated int64
+	revision, ports, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
+		var mutationErr error
+		updated, mutationErr = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
+			ID: sandbox.ID, PreviewAccess: preview.AccessPublic, TeamID: teamID,
+		})
+		return mutationErr
+	})
+	if err != nil {
+		return h.handlePreviewMutationResult(c, sandbox.ID, "UpdateSandboxPreviewAccess", err)
+	}
+	if updated == 0 {
+		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+	if !h.pushAfterPreviewMutation(c, sandbox, ports, revision) {
+		return false
+	}
+	detail, _ := json.Marshal(map[string]string{"preview_access": preview.AccessPublic})
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_access_updated", "success", &sandbox.Name, nil, detail)
+	h.capture(c, "sandbox_preview_access_updated", map[string]any{"sandbox_id": sandbox.ID.String(), "preview_access": preview.AccessPublic})
+	return true
 }
 
 // applyRowsAffectedPatch runs a rows-affected sandbox update and maps the

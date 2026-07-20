@@ -51,6 +51,11 @@ type VMRecord struct {
 	// Persisted so usage attribution survives a vmd restart.
 	TeamID  string `json:"team_id,omitempty"`
 	OwnerID string `json:"owner_id,omitempty"`
+	// Preview publication policy must survive vmd restarts; old records decode
+	// to empty/legacy behavior for backward compatibility.
+	PreviewAccess         string         `json:"preview_access,omitempty"`
+	PreviewPorts          map[int32]bool `json:"preview_ports,omitempty"`
+	PreviewPolicyRevision int64          `json:"preview_policy_revision,omitempty"`
 }
 
 // StateStore wraps a BoltDB database for VM state persistence.
@@ -184,52 +189,88 @@ func (s *StateStore) IDs() (map[string]struct{}, error) {
 func toRecord(inst *VMInstance) VMRecord {
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
+	return toRecordLocked(inst)
+}
+
+// toRecordLocked snapshots an instance while its caller holds inst.mu. It is
+// used when a state write must be serialized with the in-memory mutation.
+func toRecordLocked(inst *VMInstance) VMRecord {
 	return VMRecord{
-		ID:           inst.ID,
-		PID:          inst.PID,
-		SocketPath:   inst.SocketPath,
-		VsockPath:    inst.VsockPath,
-		IP:           inst.IP,
-		TAPDevice:    inst.TAPDevice,
-		MACAddress:   inst.MACAddress,
-		Status:       inst.Status,
-		RunDirID:     inst.RunDirID,
-		Namespace:    inst.Namespace,
-		DiskPath:     inst.DiskPath,
-		SnapshotPath: inst.SnapshotPath,
-		MemFilePath:  inst.MemFilePath,
-		BaseMemPath:  inst.BaseMemPath,
-		CreatedAt:    inst.CreatedAt,
-		Metadata:     inst.Metadata,
-		VCPU:         inst.Config.VCPU,
-		MemoryMiB:    inst.Config.MemoryMiB,
-		BasePath:     inst.Config.BasePath,
-		TeamID:       inst.TeamID,
-		OwnerID:      inst.OwnerID,
+		ID:                    inst.ID,
+		PID:                   inst.PID,
+		SocketPath:            inst.SocketPath,
+		VsockPath:             inst.VsockPath,
+		IP:                    inst.IP,
+		TAPDevice:             inst.TAPDevice,
+		MACAddress:            inst.MACAddress,
+		Status:                inst.Status,
+		RunDirID:              inst.RunDirID,
+		Namespace:             inst.Namespace,
+		DiskPath:              inst.DiskPath,
+		SnapshotPath:          inst.SnapshotPath,
+		MemFilePath:           inst.MemFilePath,
+		BaseMemPath:           inst.BaseMemPath,
+		CreatedAt:             inst.CreatedAt,
+		Metadata:              inst.Metadata,
+		VCPU:                  inst.Config.VCPU,
+		MemoryMiB:             inst.Config.MemoryMiB,
+		BasePath:              inst.Config.BasePath,
+		TeamID:                inst.TeamID,
+		OwnerID:               inst.OwnerID,
+		PreviewAccess:         inst.PreviewAccess,
+		PreviewPorts:          previewPortsToRecord(inst.PreviewPorts),
+		PreviewPolicyRevision: inst.PreviewPolicyRevision,
 	}
+}
+
+func previewPortsToRecord(in map[int32]struct{}) map[int32]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int32]bool, len(in))
+	for port := range in {
+		out[port] = true
+	}
+	return out
+}
+
+func previewPortsFromRecord(in map[int32]bool) map[int32]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int32]struct{}, len(in))
+	for port, published := range in {
+		if published {
+			out[port] = struct{}{}
+		}
+	}
+	return out
 }
 
 // toInstance converts a VMRecord back to a VMInstance.
 func toInstance(rec VMRecord) *VMInstance {
 	return &VMInstance{
-		ID:           rec.ID,
-		PID:          rec.PID,
-		SocketPath:   rec.SocketPath,
-		VsockPath:    rec.VsockPath,
-		IP:           rec.IP,
-		TAPDevice:    rec.TAPDevice,
-		MACAddress:   rec.MACAddress,
-		Status:       rec.Status,
-		RunDirID:     rec.RunDirID,
-		Namespace:    rec.Namespace,
-		DiskPath:     rec.DiskPath,
-		SnapshotPath: rec.SnapshotPath,
-		MemFilePath:  rec.MemFilePath,
-		BaseMemPath:  rec.BaseMemPath,
-		CreatedAt:    rec.CreatedAt,
-		Metadata:     rec.Metadata,
-		TeamID:       rec.TeamID,
-		OwnerID:      rec.OwnerID,
+		ID:                    rec.ID,
+		PID:                   rec.PID,
+		SocketPath:            rec.SocketPath,
+		VsockPath:             rec.VsockPath,
+		IP:                    rec.IP,
+		TAPDevice:             rec.TAPDevice,
+		MACAddress:            rec.MACAddress,
+		Status:                rec.Status,
+		RunDirID:              rec.RunDirID,
+		Namespace:             rec.Namespace,
+		DiskPath:              rec.DiskPath,
+		SnapshotPath:          rec.SnapshotPath,
+		MemFilePath:           rec.MemFilePath,
+		BaseMemPath:           rec.BaseMemPath,
+		CreatedAt:             rec.CreatedAt,
+		Metadata:              rec.Metadata,
+		TeamID:                rec.TeamID,
+		OwnerID:               rec.OwnerID,
+		PreviewAccess:         rec.PreviewAccess,
+		PreviewPorts:          previewPortsFromRecord(rec.PreviewPorts),
+		PreviewPolicyRevision: rec.PreviewPolicyRevision,
 		Config: VMConfig{
 			VCPU:      rec.VCPU,
 			MemoryMiB: rec.MemoryMiB,

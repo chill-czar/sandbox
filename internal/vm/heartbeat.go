@@ -1,13 +1,17 @@
 package vm
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // HeartbeatConfig controls the VMD → control plane heartbeat loop.
@@ -64,12 +68,24 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	}
 }
 
+var hostCapabilities = []string{preview.HostCapabilityPorts}
+
+type heartbeatRequest struct {
+	Capabilities []string `json:"capabilities"`
+}
+
 func sendHeartbeat(ctx context.Context, client *http.Client, url, token string, log zerolog.Logger) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	body, err := json.Marshal(heartbeatRequest{Capabilities: hostCapabilities})
+	if err != nil {
+		log.Error().Err(err).Msg("failed to encode heartbeat body")
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		log.Error().Err(err).Msg("failed to create heartbeat request")
 		return
 	}
+	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

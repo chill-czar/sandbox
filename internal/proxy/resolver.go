@@ -19,11 +19,13 @@ var ErrInstanceNotFound = errors.New("proxy: instance not found")
 
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
-	VMIP      string
-	Status    string
-	StartedAt int64 // Unix nanoseconds; changes on restart — used as transport lifecycle key
-	TeamID    string // owning team, for usage attribution
-	OwnerID   string // creating user, for usage attribution; empty when unknown
+	VMIP          string
+	Status        string
+	StartedAt     int64  // Unix nanoseconds; changes on restart — used as transport lifecycle key
+	TeamID        string // owning team, for usage attribution
+	OwnerID       string // creating user, for usage attribution; empty when unknown
+	PreviewAccess string
+	PreviewPorts  map[int]struct{}
 }
 
 // lifecycleKey returns a string stable for the lifetime of one VM boot.
@@ -47,7 +49,7 @@ const (
 	defaultVMDAddr   = "http://127.0.0.1:9090"
 	defaultCacheTTL  = 500 * time.Millisecond // VMD is on localhost, latency is negligible
 	negativeCacheTTL = 1 * time.Second        // cache "not found" slightly longer to absorb spam
-	maxCacheSize     = 10_000                  // cap against random instance ID amplification
+	maxCacheSize     = 10_000                 // cap against random instance ID amplification
 
 	// vmdRequestTimeout bounds a single resolve call. A steady-state lookup is a
 	// localhost map read (sub-ms), but a miss right after a VMD restart triggers
@@ -120,11 +122,13 @@ func (r *VMDResolver) Invalidate(instanceID string) {
 
 // vmdResponse matches the JSON returned by VMD's local HTTP server.
 type vmdResponse struct {
-	VMIP      string `json:"vm_ip"`
-	Status    string `json:"status"`
-	StartedAt int64  `json:"started_at"`
-	TeamID    string `json:"team_id"`
-	OwnerID   string `json:"owner_id"`
+	VMIP          string          `json:"vm_ip"`
+	Status        string          `json:"status"`
+	StartedAt     int64           `json:"started_at"`
+	TeamID        string          `json:"team_id"`
+	OwnerID       string          `json:"owner_id"`
+	PreviewAccess string          `json:"preview_access"`
+	PreviewPorts  map[string]bool `json:"preview_ports"`
 }
 
 func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInfo, error) {
@@ -153,9 +157,29 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string) (InstanceInf
 		return InstanceInfo{}, fmt.Errorf("resolver: decode response: %w", err)
 	}
 
-	info := InstanceInfo{VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt, TeamID: raw.TeamID, OwnerID: raw.OwnerID}
+	info := InstanceInfo{
+		VMIP: raw.VMIP, Status: raw.Status, StartedAt: raw.StartedAt,
+		TeamID: raw.TeamID, OwnerID: raw.OwnerID,
+		PreviewAccess: raw.PreviewAccess,
+		PreviewPorts:  decodePreviewPorts(raw.PreviewPorts),
+	}
 	r.store(instanceID, info, nil, r.ttl)
 	return info, nil
+}
+
+func decodePreviewPorts(raw map[string]bool) map[int]struct{} {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make(map[int]struct{}, len(raw))
+	for key, published := range raw {
+		port, err := strconv.Atoi(key)
+		if err != nil || !published || port < minProxiedPort || port > 65535 {
+			continue
+		}
+		out[port] = struct{}{}
+	}
+	return out
 }
 
 func (r *VMDResolver) store(instanceID string, info InstanceInfo, err error, ttl time.Duration) {
