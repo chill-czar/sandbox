@@ -30,8 +30,11 @@ import (
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
+
+const testDefaultHostID = "default"
 
 var (
 	testPool         *pgxpool.Pool
@@ -79,6 +82,10 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
 		os.Exit(1)
 	}
+	if err := seedPreviewCapableHost(ctx, testQueries); err != nil {
+		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
+		os.Exit(1)
+	}
 
 	os.Exit(m.Run())
 }
@@ -123,6 +130,43 @@ func seedSystemTemplate(ctx context.Context, q *db.Queries) error {
 		 WHERE id = $1`, tpl.ID)
 	if err != nil {
 		return fmt.Errorf("mark superserve/base ready: %w", err)
+	}
+	return nil
+}
+
+// seedPreviewCapableHost creates the fallback host selected by integration
+// routers and binds its preview capability to the current heartbeat. Strict
+// sandbox creation intentionally rejects hosts without this live attestation.
+func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
+	if _, err := q.CreateHost(ctx, db.CreateHostParams{
+		ID:                testDefaultHostID,
+		VmdAddr:           "localhost:0",
+		ProxyAddr:         "localhost:0",
+		Region:            "test",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     1,
+	}); err != nil {
+		return fmt.Errorf("create default host: %w", err)
+	}
+	if _, err := q.UpdateHostHeartbeat(ctx, testDefaultHostID); err != nil {
+		return fmt.Errorf("heartbeat default host: %w", err)
+	}
+	if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+		HostID:     testDefaultHostID,
+		Capability: preview.HostCapabilityPorts,
+	}); err != nil {
+		return fmt.Errorf("advertise preview capability: %w", err)
+	}
+
+	capable, err := q.HostHasCapability(ctx, db.HostHasCapabilityParams{
+		HostID:     testDefaultHostID,
+		Capability: preview.HostCapabilityPorts,
+	})
+	if err != nil {
+		return fmt.Errorf("verify preview capability: %w", err)
+	}
+	if !capable {
+		return fmt.Errorf("preview capability is not bound to the current heartbeat")
 	}
 	return nil
 }
@@ -471,9 +515,10 @@ func waitBookkeeping() {
 func newRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	cfg := &config.Config{
-		Port:         "0",
-		VMDAddress:   "localhost:0",
-		SystemTeamID: testSystemTeamID.String(),
+		Port:          "0",
+		VMDAddress:    "localhost:0",
+		SystemTeamID:  testSystemTeamID.String(),
+		DefaultHostID: testDefaultHostID,
 	}
 	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
 	h.Pool = testPool
