@@ -475,14 +475,31 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	resumeVMDAccess := resumePolicy.vmdAccess()
-	if resumeVMDAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
+	if resumePolicy.requiresTokenCapability() {
+		if !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
 			return false
+		}
+		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
+		// revision. Advance under the sandbox row lock before restoring so the
+		// tokenized per-port entries always have a strictly newer ordering key.
+		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
+			return nil
+		}, func(q *db.Queries, _ previewPolicySnapshot) error {
+			return validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
+				preview.HostCapabilityPorts,
+				preview.HostCapabilityPortAccess,
+				preview.HostCapabilityPortTokens,
+			)
+		})
+		if err != nil {
+			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewTokensForResume", err) {
+				return false
+			}
 		}
 	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
 		return false
 	}
+	resumeVMDAccess := resumePolicy.vmdAccess()
 
 	// Serialize the paused→resuming claim with attach/detach via a DB advisory
 	// lock (held only for the claim). Both take the same lock and re-read status
@@ -592,7 +609,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.Ports, resumePolicy.Revision, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -675,7 +692,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.Ports, currentPolicy.Revision); policyErr != nil {
+	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
 		if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
 			// Legacy sandboxes remain compatible with a VMD from before policy
 			// updates existed. Strict resumes were capability-gated above and may
@@ -1718,7 +1735,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var hostID string
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
-		requiredCapabilities = append(requiredCapabilities, preview.HostCapabilityPortAccess)
+		requiredCapabilities = append(requiredCapabilities,
+			preview.HostCapabilityPortAccess,
+			preview.HostCapabilityPortTokens,
+		)
 	}
 	if h.Scheduler != nil {
 		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
@@ -1738,7 +1758,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// are only hints; heartbeat capability state can change between selection
 	// and VM creation.
 	if previewAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortAccess(c, hostID) {
+		if !h.requireHostPreviewPortTokens(c, hostID) {
 			return
 		}
 	} else if !h.requireHostPreviewPorts(c, hostID) {
@@ -2637,16 +2657,31 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 }
 
 func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
-	if !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
+	requiresTokens := access == preview.AccessPrivate
+	if !requiresTokens {
+		current, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandbox.ID, teamID)
+		if err != nil {
+			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("load preview policy before access update failed")
+			respondError(c, ErrInternal)
+			return false
+		}
+		requiresTokens = current.hasPrivatePorts()
+	}
+	if requiresTokens && !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
+		return false
+	}
+	if !requiresTokens && !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
 		return false
 	}
 	var updated int64
-	policy, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
+	policy, err := h.applyPreviewMutationValidated(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
 		var mutationErr error
 		updated, mutationErr = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
 			SandboxID: sandbox.ID, DefaultAccess: access, TeamID: teamID,
 		})
 		return mutationErr
+	}, func(q *db.Queries, result previewPolicySnapshot) error {
+		return validateHostForPreviewSnapshot(c.Request.Context(), q, sandbox.HostID, result)
 	})
 	if err != nil {
 		return h.handlePreviewMutationResult(c, sandbox.ID, "UpdateSandboxPreviewAccess", err)
