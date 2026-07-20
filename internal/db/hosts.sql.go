@@ -15,7 +15,7 @@ import (
 const createHost = `-- name: CreateHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
 `
 
 type CreateHostParams struct {
@@ -48,13 +48,21 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.Capabilities,
 	)
 	return i, err
 }
 
+const deleteHostCapabilities = `-- name: DeleteHostCapabilities :exec
+DELETE FROM host_capability WHERE host_id = $1
+`
+
+func (q *Queries) DeleteHostCapabilities(ctx context.Context, hostID string) error {
+	_, err := q.db.Exec(ctx, deleteHostCapabilities, hostID)
+	return err
+}
+
 const getHost = `-- name: GetHost :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities FROM host WHERE id = $1
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -71,13 +79,53 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.Capabilities,
 	)
 	return i, err
 }
 
+const hostHasCapability = `-- name: HostHasCapability :one
+SELECT EXISTS(
+  SELECT 1
+  FROM host_capability hc
+  JOIN host h ON h.id = hc.host_id
+  WHERE hc.host_id = $1 AND hc.capability = $2
+    AND hc.heartbeat_at = h.last_heartbeat_at
+)
+`
+
+type HostHasCapabilityParams struct {
+	HostID     string `json:"host_id"`
+	Capability string `json:"capability"`
+}
+
+func (q *Queries) HostHasCapability(ctx context.Context, arg HostHasCapabilityParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hostHasCapability, arg.HostID, arg.Capability)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const insertHostCapability = `-- name: InsertHostCapability :exec
+INSERT INTO host_capability (host_id, capability, heartbeat_at)
+SELECT id, $1, last_heartbeat_at
+FROM host
+WHERE id = $2 AND last_heartbeat_at IS NOT NULL
+ON CONFLICT (host_id, capability)
+DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at
+`
+
+type InsertHostCapabilityParams struct {
+	Capability string `json:"capability"`
+	HostID     string `json:"host_id"`
+}
+
+func (q *Queries) InsertHostCapability(ctx context.Context, arg InsertHostCapabilityParams) error {
+	_, err := q.db.Exec(ctx, insertHostCapability, arg.Capability, arg.HostID)
+	return err
+}
+
 const listActiveHosts = `-- name: ListActiveHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
 WHERE status = 'active'
 ORDER BY created_at ASC
 `
@@ -102,7 +150,6 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.Capabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -124,6 +171,12 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
+  AND EXISTS (
+    SELECT 1 FROM host_capability hc
+    WHERE hc.host_id = h.id
+      AND hc.capability = 'preview_ports_v1'
+      AND hc.heartbeat_at = h.last_heartbeat_at
+  )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC
 `
@@ -178,7 +231,7 @@ func (q *Queries) ListActiveHostsByLoad(ctx context.Context) ([]ListActiveHostsB
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
 ORDER BY created_at ASC
 `
 
@@ -202,7 +255,6 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.Capabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -215,7 +267,7 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 }
 
 const listStaleHosts = `-- name: ListStaleHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at FROM host
 WHERE status = 'active'
   AND last_heartbeat_at IS NOT NULL
   AND last_heartbeat_at < $1
@@ -244,7 +296,6 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 			&i.LastHeartbeatAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
-			&i.Capabilities,
 		); err != nil {
 			return nil, err
 		}
@@ -270,23 +321,17 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 const updateHostHeartbeat = `-- name: UpdateHostHeartbeat :one
 UPDATE host
 SET last_heartbeat_at = now(),
-    capabilities = $2,
     status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
     updated_at = now()
 WHERE id = $1
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, capabilities
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at
 `
-
-type UpdateHostHeartbeatParams struct {
-	ID           string   `json:"id"`
-	Capabilities []string `json:"capabilities"`
-}
 
 // Returns the host row so the caller can verify the host exists. Also
 // re-activates unhealthy hosts that resume heartbeating — this is the
 // automatic recovery path after a transient network outage.
-func (q *Queries) UpdateHostHeartbeat(ctx context.Context, arg UpdateHostHeartbeatParams) (Host, error) {
-	row := q.db.QueryRow(ctx, updateHostHeartbeat, arg.ID, arg.Capabilities)
+func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (Host, error) {
+	row := q.db.QueryRow(ctx, updateHostHeartbeat, id)
 	var i Host
 	err := row.Scan(
 		&i.ID,
@@ -299,7 +344,6 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, arg UpdateHostHeartbe
 		&i.LastHeartbeatAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
-		&i.Capabilities,
 	)
 	return i, err
 }

@@ -465,6 +465,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	// Resolve the effective policy before claiming the sandbox. A missing
+	// side-table row is an older control plane's legacy sandbox; strict
+	// sandboxes may only resume while their host proves enforcement support.
+	// The snapshot is also the fallback payload if VMD lost its in-memory VM.
+	resumePolicy, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandboxID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load preview policy for resume failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+	if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		return false
+	}
+
 	// Serialize the paused→resuming claim with attach/detach via a DB advisory
 	// lock (held only for the claim). Both take the same lock and re-read status
 	// under it, so across API instances a mutation can't read a stale 'paused' and
@@ -480,7 +494,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	}
 	var (
 		claimed db.Sandbox
-		err     error
 	)
 	if h.Pool == nil {
 		claimed, err = claimResume(h.DB)
@@ -574,14 +587,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			previewPorts, portsErr := h.loadPreviewPorts(c.Request.Context(), sandboxID)
-			if portsErr != nil {
-				log.Error().Err(portsErr).Str("sandbox_id", sandboxID.String()).Msg("load published ports for resume failed")
-				revertToPaused()
-				respondError(c, ErrInternal)
-				return false
-			}
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), sandbox.PreviewAccess, previewPorts, sandbox.PreviewPolicyRevision, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumePolicy.Access, resumePolicy.Ports, resumePolicy.Revision, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -650,6 +656,31 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
 			revertToPaused()
+		}
+	}
+
+	// Re-read and push after the VM is present. A publication mutation can race
+	// the stateless restore while VMD returns NotFound to the mutation push; this
+	// final authoritative snapshot closes that window. If a later mutation wins,
+	// VMD's monotonic revision check rejects this older snapshot.
+	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
+	if policyErr != nil {
+		log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reload preview policy after resume failed")
+		pauseAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	}
+	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.Access, currentPolicy.Ports, currentPolicy.Revision); policyErr != nil {
+		if currentPolicy.Access == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
+			// Legacy sandboxes remain compatible with a VMD from before policy
+			// updates existed. Strict resumes were capability-gated above and may
+			// never take this fallback.
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks preview policy update for legacy resume")
+		} else {
+			log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reapply preview policy after resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return false
 		}
 	}
 
@@ -865,7 +896,15 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(*sandbox))
+	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandbox.ID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	resp := h.sandboxToResponseWithToken(*sandbox)
+	resp.PreviewAccess = policy.Access
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
@@ -1214,14 +1253,16 @@ type sandboxSecretBinding struct {
 
 func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	resp := sandboxResponse{
-		ID:            formatSandboxID(s.ID),
-		Name:          s.Name,
-		Status:        string(s.Status),
-		VcpuCount:     s.VcpuCount,
-		MemoryMib:     s.MemoryMib,
-		CreatedAt:     s.CreatedAt,
-		Metadata:      decodeMetadata(s.Metadata),
-		PreviewAccess: s.PreviewAccess,
+		ID:        formatSandboxID(s.ID),
+		Name:      s.Name,
+		Status:    string(s.Status),
+		VcpuCount: s.VcpuCount,
+		MemoryMib: s.MemoryMib,
+		CreatedAt: s.CreatedAt,
+		Metadata:  decodeMetadata(s.Metadata),
+		// No side-table row means the sandbox came from an older control plane.
+		// Callers that load policy data overwrite this legacy-safe default.
+		PreviewAccess: preview.AccessLegacyPublic,
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -1392,10 +1433,23 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return
 	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
+	policies, err := h.DB.ListSandboxPreviewPoliciesByTeam(ctx, teamID)
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListSandboxPreviewPoliciesByTeam failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	previewAccessBySandbox := make(map[uuid.UUID]string, len(policies))
+	for _, policy := range policies {
+		previewAccessBySandbox[policy.SandboxID] = policy.Access
+	}
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
 		out[i] = h.sandboxToResponse(s)
+		if access, ok := previewAccessBySandbox[s.ID]; ok {
+			out[i].PreviewAccess = access
+		}
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -1462,6 +1516,13 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 
 	resp := h.sandboxToResponse(sandbox)
+	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	resp.PreviewAccess = policy.Access
 	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
 	if permErr != nil {
 		log.Error().
@@ -1471,6 +1532,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
+		resp.PreviewAccess = policy.Access
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -1733,17 +1795,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:         nil,
 		})
 	}
-	// insertWithBindings writes the sandbox row, and its secret bindings in the
-	// same transaction when any are attached, so a successful create never leaves
-	// a binding unrecorded. With no secrets it is a plain insert — no transaction.
+	// insertWithBindings writes the sandbox row, its strict preview policy, and
+	// any secret bindings in one transaction. An absent policy row deliberately
+	// means "created by an older control plane" and therefore legacy-public, so a
+	// new sandbox must never become visible without its explicit strict row.
 	insertWithBindings := func() (db.Sandbox, error) {
-		if len(secretBindings) == 0 {
-			return runInsert(h.DB)
-		}
 		runBoth := func(q *db.Queries) (db.Sandbox, error) {
 			sb, err := runInsert(q)
 			if err != nil {
 				return db.Sandbox{}, err
+			}
+			if err := q.CreateSandboxPreviewPolicy(insertCtx, db.CreateSandboxPreviewPolicyParams{
+				SandboxID: sandboxID,
+				Access:    preview.AccessPublic,
+			}); err != nil {
+				return db.Sandbox{}, fmt.Errorf("insert preview policy: %w", err)
+			}
+			if len(secretBindings) == 0 {
+				return sb, nil
 			}
 			secretIDs := make([]uuid.UUID, len(secretBindings))
 			envKeys := make([]string, len(secretBindings))
@@ -1889,6 +1958,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
 
+	// Re-attest the live VMD after RestoreSnapshot. The host capability was
+	// checked before boot, but VMD can roll back in that window; an older VMD
+	// ignores the additive RestoreSnapshot policy fields and would otherwise
+	// create a legacy/all-port VM. The new RPC is deliberately required even
+	// for initial revision zero. Do this before env injection or any 201-visible
+	// side effects so failure tears the VM down without exposing it.
+	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), preview.AccessPublic, nil, 0); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+		respondError(c, ErrInternal)
+		return
+	}
+
 	// Persist egress rules before injecting the env, so the secrets proxy's live
 	// rule fetch sees them before the agent can issue a proxied request. The
 	// nftables push happens later (it needs the booted VM); the DB write does not.
@@ -2018,6 +2100,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
+	resp.PreviewAccess = preview.AccessPublic
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -2539,12 +2622,11 @@ func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, t
 	if !h.requireHostPreviewPorts(c, sandbox.HostID) {
 		return false
 	}
-	sandbox.PreviewAccess = preview.AccessPublic
 	var updated int64
-	revision, ports, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
+	policy, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
 		var mutationErr error
 		updated, mutationErr = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
-			ID: sandbox.ID, PreviewAccess: preview.AccessPublic, TeamID: teamID,
+			SandboxID: sandbox.ID, Access: preview.AccessPublic, TeamID: teamID,
 		})
 		return mutationErr
 	})
@@ -2555,7 +2637,7 @@ func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, t
 		respondError(c, ErrSandboxNotFound)
 		return false
 	}
-	if !h.pushAfterPreviewMutation(c, sandbox, ports, revision) {
+	if !h.pushAfterPreviewMutation(c, sandbox, policy) {
 		return false
 	}
 	detail, _ := json.Marshal(map[string]string{"preview_access": preview.AccessPublic})

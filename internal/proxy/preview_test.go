@@ -39,7 +39,7 @@ func TestPreviewPublicationStrictRequiresPublishedPort(t *testing.T) {
 func TestPreviewPublicationUnknownPolicyFailsClosedEvenWhenPublished(t *testing.T) {
 	w := httptest.NewRecorder()
 	info := InstanceInfo{
-		PreviewAccess: "future-private-mode",
+		PreviewAccess: "future-mode",
 		PreviewPorts:  map[int]struct{}{3000: {}},
 	}
 	if enforcePreviewPublication(w, 3000, info) {

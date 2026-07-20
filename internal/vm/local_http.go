@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
 // LocalHTTPServer serves a minimal HTTP API on localhost for the edge proxy
@@ -113,6 +115,13 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 
 	info, ok := s.mgr.LookupInstance(instanceID)
 	if !ok {
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
+	if info.PreviewAccess != "" && info.PreviewAccess != preview.AccessLegacyPublic &&
+		r.Header.Get(preview.ProxyProtocolHeader) != preview.HostCapabilityPorts {
+		// Older proxies do not enforce explicit publication. Hide strict (and any
+		// future non-legacy) policy records from them so rollback fails closed.
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}

@@ -1572,6 +1572,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return existing, nil
 	}
 
+	// A control plane from before preview publication sends the zero-value
+	// policy on restore. Preserve an existing in-memory or sidecar-backed policy
+	// whenever its revision is at least as new, including strict revision zero;
+	// otherwise rolling back and forward could reopen every port in memory even
+	// though StateStore correctly retained the durable sidecar.
+	previewAccess, previewPorts, previewPolicyRevision, policyErr := m.previewPolicyForRestore(
+		vmID, previewAccess, previewPorts, previewPolicyRevision,
+	)
+	if policyErr != nil {
+		return nil, status.Errorf(codes.Internal, "load existing preview policy for restore: %v", policyErr)
+	}
+
 	// Bound concurrent restores so a burst of sandbox creates doesn't
 	// saturate host file I/O, netns setup, tmpfs, and Firecracker boots.
 	// Fail fast with ctx.Err() if the caller's deadline fires while we
@@ -2446,6 +2458,44 @@ func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
 		out[port] = struct{}{}
 	}
 	return out
+}
+
+// previewPolicyForRestore merges incoming wire policy with any policy already
+// known for this VM. Revisions identify immutable snapshots, so existing state
+// wins equality. The durable sidecar is considered after memory and therefore
+// wins an equal-revision disagreement caused by an old VMD rewriting only the
+// primary lifecycle JSON.
+func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]struct{}, incomingRevision int64) (string, map[int32]struct{}, int64, error) {
+	access := incomingAccess
+	ports := clonePreviewPorts(incomingPorts)
+	revision := incomingRevision
+
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst != nil {
+		inst.mu.RLock()
+		existingAccess := inst.PreviewAccess
+		existingPorts := clonePreviewPorts(inst.PreviewPorts)
+		existingRevision := inst.PreviewPolicyRevision
+		inst.mu.RUnlock()
+		if existingRevision >= revision {
+			access, ports, revision = existingAccess, existingPorts, existingRevision
+		}
+	}
+
+	if m.state != nil {
+		rec, err := m.state.Get(vmID)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		if rec != nil && rec.PreviewPolicyRevision >= revision {
+			access = rec.PreviewAccess
+			ports = previewPortsFromRecord(rec.PreviewPorts)
+			revision = rec.PreviewPolicyRevision
+		}
+	}
+	return access, ports, revision, nil
 }
 
 // UpdateSandboxPreviewPolicy replaces the policy persisted on the instance

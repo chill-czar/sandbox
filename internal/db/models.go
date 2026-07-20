@@ -295,8 +295,14 @@ type Host struct {
 	LastHeartbeatAt   pgtype.Timestamptz `json:"last_heartbeat_at"`
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
-	// Data-plane capabilities advertised by the currently running vmd/proxy build.
-	Capabilities []string `json:"capabilities"`
+}
+
+// Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
+type HostCapability struct {
+	HostID      string    `json:"host_id"`
+	Capability  string    `json:"capability"`
+	HeartbeatAt time.Time `json:"heartbeat_at"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type NetFlow struct {
@@ -437,9 +443,6 @@ type Sandbox struct {
 	DiskMib           int32              `json:"disk_mib"`
 	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
 	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
-	// Preview routing mode: legacy_public routes every listening port; public routes only explicitly published ports.
-	PreviewAccess         string `json:"preview_access"`
-	PreviewPolicyRevision int64  `json:"preview_policy_revision"`
 }
 
 type SandboxActiveInterval struct {
@@ -461,6 +464,15 @@ type SandboxComputeBillingInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+// Preview routing policy. No row means legacy all-port routing; public rows route only explicitly published ports.
+type SandboxPreviewPolicy struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Access    string    `json:"access"`
+	Revision  int64     `json:"revision"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Public preview ports explicitly routable for a strict sandbox.

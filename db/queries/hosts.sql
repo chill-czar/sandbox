@@ -26,11 +26,30 @@ WHERE id = $1;
 -- automatic recovery path after a transient network outage.
 UPDATE host
 SET last_heartbeat_at = now(),
-    capabilities = $2,
     status = CASE WHEN status = 'unhealthy' THEN 'active' ELSE status END,
     updated_at = now()
 WHERE id = $1
 RETURNING *;
+
+-- name: DeleteHostCapabilities :exec
+DELETE FROM host_capability WHERE host_id = $1;
+
+-- name: InsertHostCapability :exec
+INSERT INTO host_capability (host_id, capability, heartbeat_at)
+SELECT id, sqlc.arg(capability), last_heartbeat_at
+FROM host
+WHERE id = sqlc.arg(host_id) AND last_heartbeat_at IS NOT NULL
+ON CONFLICT (host_id, capability)
+DO UPDATE SET heartbeat_at = EXCLUDED.heartbeat_at;
+
+-- name: HostHasCapability :one
+SELECT EXISTS(
+  SELECT 1
+  FROM host_capability hc
+  JOIN host h ON h.id = hc.host_id
+  WHERE hc.host_id = $1 AND hc.capability = $2
+    AND hc.heartbeat_at = h.last_heartbeat_at
+);
 
 -- name: MarkHostUnhealthy :exec
 UPDATE host
@@ -59,5 +78,11 @@ LEFT JOIN sandbox s ON s.host_id = h.id
   AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
+  AND EXISTS (
+    SELECT 1 FROM host_capability hc
+    WHERE hc.host_id = h.id
+      AND hc.capability = 'preview_ports_v1'
+      AND hc.heartbeat_at = h.last_heartbeat_at
+  )
 GROUP BY h.id
 ORDER BY COUNT(s.id) ASC;

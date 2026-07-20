@@ -39,9 +39,24 @@ func scalarInt32Row(value int32) pgx.Row {
 	}}
 }
 
-func scalarInt64Row(value int64) pgx.Row {
+func scalarBoolRow(value bool) pgx.Row {
 	return &mockRow{scanFn: func(dest ...any) error {
-		*dest[0].(*int64) = value
+		*dest[0].(*bool) = value
+		return nil
+	}}
+}
+
+func scalarUUIDRow(value uuid.UUID) pgx.Row {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = value
+		return nil
+	}}
+}
+
+func previewPolicyRow(access string, revision int64) pgx.Row {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*string) = access
+		*dest[1].(*int64) = revision
 		return nil
 	}}
 }
@@ -62,12 +77,14 @@ func TestListSandboxPreviewPortsReturnsAuthoritativeAllowlist(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, HostID: "host-a",
-		PreviewAccess: preview.AccessPublic,
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: GetSandbox :one") {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPublic, 7)
 			}
 			return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 		},
@@ -106,7 +123,6 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, HostID: "host-old",
-		PreviewAccess: preview.AccessLegacyPublic,
 	}
 	mutated := false
 	mock := &mockDBTX{
@@ -114,9 +130,9 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
-			case strings.Contains(sql, "-- name: GetHost :one"):
-				return hostRow(db.Host{ID: sandbox.HostID})
-			case strings.Contains(sql, "BumpPreviewPolicyRevision"), strings.Contains(sql, "PublishPort"):
+			case strings.Contains(sql, "-- name: HostHasCapability :one"):
+				return scalarBoolRow(false)
+			case strings.Contains(sql, "AdvanceSandboxPreviewPolicy"), strings.Contains(sql, "PublishPort"), strings.Contains(sql, "LockSandboxForPreviewMutation"):
 				mutated = true
 				return errorRow(fmt.Errorf("mutation must not run"))
 			default:
@@ -148,11 +164,10 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	}
 }
 
-func TestPublishPreviewPortPushesFullAllowlist(t *testing.T) {
+func TestPublishPreviewPortPushesAuthoritativePolicySnapshot(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, HostID: "host-new", Name: "preview",
-		PreviewAccess: preview.AccessPublic,
 	}
 	activityFinished := make(chan struct{}, 1)
 	mock := &mockDBTX{
@@ -160,10 +175,12 @@ func TestPublishPreviewPortPushesFullAllowlist(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
-			case strings.Contains(sql, "-- name: GetHost :one"):
-				return hostRow(db.Host{ID: sandbox.HostID, Capabilities: []string{preview.HostCapabilityPorts}})
-			case strings.Contains(sql, "-- name: BumpPreviewPolicyRevision :one"):
-				return scalarInt64Row(11)
+			case strings.Contains(sql, "-- name: HostHasCapability :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPublic, 11)
 			case strings.Contains(sql, "-- name: PublishPort :one"):
 				return scalarInt32Row(3000)
 			case strings.Contains(sql, "-- name: CreateActivity :one"):
@@ -184,6 +201,9 @@ func TestPublishPreviewPortPushesFullAllowlist(t *testing.T) {
 			return nil, fmt.Errorf("unexpected Query: %s", sql)
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: EnsureSandboxPreviewPolicy :exec") {
+				return pgconn.NewCommandTag("INSERT 0 1"), nil
+			}
 			return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
 		},
 	}
@@ -253,7 +273,6 @@ func TestUnpublishPreviewPortRetryRepushesFullAllowlist(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, HostID: "host-a", Name: "preview",
-		PreviewAccess: preview.AccessPublic,
 	}
 	revision := int64(40)
 	deleteCalls := 0
@@ -262,9 +281,11 @@ func TestUnpublishPreviewPortRetryRepushesFullAllowlist(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
-			case strings.Contains(sql, "-- name: BumpPreviewPolicyRevision :one"):
+			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
+				return scalarUUIDRow(sandboxID)
+			case strings.Contains(sql, "-- name: AdvanceSandboxPreviewPolicy :one"):
 				revision++
-				return scalarInt64Row(revision)
+				return previewPolicyRow(preview.AccessPublic, revision)
 			default:
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
@@ -276,6 +297,9 @@ func TestUnpublishPreviewPortRetryRepushesFullAllowlist(t *testing.T) {
 			return nil, fmt.Errorf("unexpected Query: %s", sql)
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: EnsureSandboxPreviewPolicy :exec") {
+				return pgconn.NewCommandTag("INSERT 0 1"), nil
+			}
 			if strings.Contains(sql, "-- name: UnpublishPort :execrows") {
 				deleteCalls++
 				if deleteCalls == 1 {

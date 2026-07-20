@@ -366,20 +366,61 @@ UPDATE sandbox
 SET metadata = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 
--- name: UpdateSandboxPreviewAccess :execrows
-UPDATE sandbox
-SET preview_access = $2, updated_at = now()
-WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
+-- name: CreateSandboxPreviewPolicy :exec
+INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+VALUES ($1, $2, 0);
 
--- name: BumpPreviewPolicyRevision :one
--- This row update is the per-sandbox serialization point for publication
--- mutations. Call it first inside the same transaction as the mutation and
--- authoritative allowlist read; vmd uses the returned generation to reject
--- stale full-set pushes.
-UPDATE sandbox
-SET preview_policy_revision = preview_policy_revision + 1, updated_at = now()
+-- name: GetSandboxPreviewPolicy :one
+-- An absent side-table row is the rolling-deploy-safe representation of a
+-- sandbox created by an older control plane.
+SELECT
+  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.revision, 0)::bigint AS revision
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
+
+-- name: ListSandboxPreviewPoliciesByTeam :many
+SELECT
+  s.id AS sandbox_id,
+  COALESCE(p.access, 'legacy_public')::text AS access,
+  COALESCE(p.revision, 0)::bigint AS revision
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.team_id = $1 AND s.destroyed_at IS NULL;
+
+-- name: LockSandboxForPreviewMutation :one
+-- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
+-- so it is the stable per-sandbox serialization point across the transition.
+SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-RETURNING preview_policy_revision;
+FOR UPDATE;
+
+-- name: EnsureSandboxPreviewPolicy :exec
+-- Publication may be staged on a legacy sandbox before it is switched to
+-- strict mode. Materialize its legacy access so the revision can still order
+-- full-set pushes without changing reachability.
+INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+VALUES ($1, $2, 0)
+ON CONFLICT (sandbox_id) DO NOTHING;
+
+-- name: UpdateSandboxPreviewAccess :execrows
+UPDATE sandbox_preview_policy p
+SET access = $2, updated_at = now()
+WHERE p.sandbox_id = $1
+  AND EXISTS (
+    SELECT 1 FROM sandbox s
+    WHERE s.id = p.sandbox_id AND s.team_id = $3 AND s.destroyed_at IS NULL
+  );
+
+-- name: AdvanceSandboxPreviewPolicy :one
+-- Call after the mutation while holding LockSandboxForPreviewMutation. The
+-- returned access and revision belong to the same authoritative snapshot as
+-- the allowlist read that follows.
+UPDATE sandbox_preview_policy
+SET revision = revision + 1, updated_at = now()
+WHERE sandbox_id = $1
+RETURNING access, revision;
 
 -- name: ListPublishedPorts :many
 SELECT port FROM sandbox_published_port

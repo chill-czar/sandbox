@@ -51,10 +51,40 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		capabilities = append(capabilities, capability)
 	}
 
-	host, err := h.DB.UpdateHostHeartbeat(c.Request.Context(), db.UpdateHostHeartbeatParams{
-		ID:           hostID,
-		Capabilities: capabilities,
-	})
+	ctx := c.Request.Context()
+	replace := func(q *db.Queries) (db.Host, error) {
+		host, err := q.UpdateHostHeartbeat(ctx, hostID)
+		if err != nil {
+			return db.Host{}, err
+		}
+		// Missing capabilities is an explicit empty replacement. This clears a
+		// stale attestation immediately when VMD can no longer verify its proxy.
+		if err := q.DeleteHostCapabilities(ctx, hostID); err != nil {
+			return db.Host{}, err
+		}
+		for _, capability := range capabilities {
+			if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+				HostID: hostID, Capability: capability,
+			}); err != nil {
+				return db.Host{}, err
+			}
+		}
+		return host, nil
+	}
+
+	var host db.Host
+	var err error
+	if h.Pool == nil {
+		host, err = replace(h.DB)
+	} else {
+		var tx pgx.Tx
+		if tx, err = h.Pool.Begin(ctx); err == nil {
+			defer tx.Rollback(ctx)
+			if host, err = replace(h.DB.WithTx(tx)); err == nil {
+				err = tx.Commit(ctx)
+			}
+		}
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)

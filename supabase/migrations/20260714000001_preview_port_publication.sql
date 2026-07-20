@@ -1,25 +1,23 @@
 -- Phase 1: explicit publication for public preview ports.
 --
 -- Existing sandboxes retain the historical behavior where every listening
--- non-privileged port is routable. Sandboxes created after this migration are
--- strict by default: only rows in sandbox_published_port are routable.
+-- non-privileged port is routable. The new control plane explicitly creates a
+-- policy row for each new sandbox; an absent row therefore remains the
+-- rolling-deploy-safe legacy representation used by older binaries.
 
-ALTER TABLE sandbox ADD COLUMN preview_access text;
+CREATE TABLE sandbox_preview_policy (
+    sandbox_id uuid PRIMARY KEY REFERENCES sandbox (id) ON DELETE CASCADE,
+    access text NOT NULL,
+    revision bigint NOT NULL DEFAULT 0,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT sandbox_preview_policy_access_valid
+        CHECK (access IN ('legacy_public', 'public'))
+);
 
--- The column is nullable only inside this transaction. Rows visible before the
--- migration are compatibility sandboxes; future inserts default to strict.
-UPDATE sandbox SET preview_access = 'legacy_public';
-
-ALTER TABLE sandbox
-    ALTER COLUMN preview_access SET DEFAULT 'public',
-    ALTER COLUMN preview_access SET NOT NULL,
-    ADD COLUMN preview_policy_revision bigint NOT NULL DEFAULT 0,
-    ADD CONSTRAINT sandbox_preview_access_valid
-        CHECK (preview_access IN ('legacy_public', 'public'));
-
-COMMENT ON COLUMN sandbox.preview_access IS
-    'Preview routing mode: legacy_public routes every listening port; public '
-    'routes only explicitly published ports.';
+COMMENT ON TABLE sandbox_preview_policy IS
+    'Preview routing policy. No row means legacy all-port routing; public '
+    'rows route only explicitly published ports.';
 
 CREATE TABLE sandbox_published_port (
     sandbox_id uuid NOT NULL REFERENCES sandbox (id) ON DELETE CASCADE,
@@ -33,10 +31,19 @@ CREATE TABLE sandbox_published_port (
 COMMENT ON TABLE sandbox_published_port IS
     'Public preview ports explicitly routable for a strict sandbox.';
 
--- The heartbeat replaces this list on every beat, so rolling a host back to a
--- build that does not enforce publication immediately removes its capability.
-ALTER TABLE host
-    ADD COLUMN capabilities text[] NOT NULL DEFAULT '{}';
+-- Kept outside host so adding the migration cannot change the result shape of
+-- SELECT */RETURNING * queries embedded in an older rolling control plane.
+CREATE TABLE host_capability (
+    host_id text NOT NULL REFERENCES host (id) ON DELETE CASCADE,
+    capability text NOT NULL,
+    heartbeat_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (host_id, capability),
+    CONSTRAINT host_capability_value_valid
+        CHECK (capability <> '' AND octet_length(capability) <= 64)
+);
 
-COMMENT ON COLUMN host.capabilities IS
-    'Data-plane capabilities advertised by the currently running vmd/proxy build.';
+COMMENT ON TABLE host_capability IS
+    'Data-plane capabilities jointly advertised by the currently running host services. '
+    'heartbeat_at must match host.last_heartbeat_at, so an old control-plane '
+    'heartbeat automatically invalidates an attestation it cannot replace.';

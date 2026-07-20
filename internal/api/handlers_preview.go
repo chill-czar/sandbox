@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"slices"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -39,6 +38,29 @@ func (h *Handlers) loadPreviewPorts(ctx context.Context, sandboxID uuid.UUID) (m
 	return publishedPortSet(rows), nil
 }
 
+type previewPolicySnapshot struct {
+	Access   string
+	Revision int64
+	Ports    map[int32]struct{}
+}
+
+func (h *Handlers) loadPreviewPolicy(ctx context.Context, sandboxID, teamID uuid.UUID) (previewPolicySnapshot, error) {
+	row, err := h.DB.GetSandboxPreviewPolicy(ctx, db.GetSandboxPreviewPolicyParams{ID: sandboxID, TeamID: teamID})
+	if err != nil {
+		return previewPolicySnapshot{}, err
+	}
+	return previewPolicySnapshot{Access: row.Access, Revision: row.Revision}, nil
+}
+
+func (h *Handlers) loadPreviewPolicySnapshot(ctx context.Context, sandboxID, teamID uuid.UUID) (previewPolicySnapshot, error) {
+	policy, err := h.loadPreviewPolicy(ctx, sandboxID, teamID)
+	if err != nil {
+		return previewPolicySnapshot{}, err
+	}
+	policy.Ports, err = h.loadPreviewPorts(ctx, sandboxID)
+	return policy, err
+}
+
 func publishedPortSet(ports []int32) map[int32]struct{} {
 	if len(ports) == 0 {
 		return nil
@@ -53,23 +75,32 @@ func publishedPortSet(ports []int32) map[int32]struct{} {
 // applyPreviewMutation serializes publication changes on the sandbox row,
 // performs the mutation, and reads the resulting full allowlist in the same
 // transaction. The returned revision orders the later vmd pushes.
-func (h *Handlers) applyPreviewMutation(ctx context.Context, sandboxID, teamID uuid.UUID, mutate func(*db.Queries) error) (int64, map[int32]struct{}, error) {
-	run := func(q *db.Queries) (int64, map[int32]struct{}, error) {
-		revision, err := q.BumpPreviewPolicyRevision(ctx, db.BumpPreviewPolicyRevisionParams{ID: sandboxID, TeamID: teamID})
-		if err != nil {
+func (h *Handlers) applyPreviewMutation(ctx context.Context, sandboxID, teamID uuid.UUID, mutate func(*db.Queries) error) (previewPolicySnapshot, error) {
+	run := func(q *db.Queries) (previewPolicySnapshot, error) {
+		if _, err := q.LockSandboxForPreviewMutation(ctx, db.LockSandboxForPreviewMutationParams{ID: sandboxID, TeamID: teamID}); err != nil {
 			if err == pgx.ErrNoRows {
-				return 0, nil, ErrSandboxNotFound
+				return previewPolicySnapshot{}, ErrSandboxNotFound
 			}
-			return 0, nil, err
+			return previewPolicySnapshot{}, err
+		}
+		if err := q.EnsureSandboxPreviewPolicy(ctx, db.EnsureSandboxPreviewPolicyParams{
+			SandboxID: sandboxID,
+			Access:    preview.AccessLegacyPublic,
+		}); err != nil {
+			return previewPolicySnapshot{}, err
 		}
 		if err := mutate(q); err != nil {
-			return 0, nil, err
+			return previewPolicySnapshot{}, err
+		}
+		policy, err := q.AdvanceSandboxPreviewPolicy(ctx, sandboxID)
+		if err != nil {
+			return previewPolicySnapshot{}, err
 		}
 		ports, err := q.ListPublishedPorts(ctx, sandboxID)
 		if err != nil {
-			return 0, nil, err
+			return previewPolicySnapshot{}, err
 		}
-		return revision, publishedPortSet(ports), nil
+		return previewPolicySnapshot{Access: policy.Access, Revision: policy.Revision, Ports: publishedPortSet(ports)}, nil
 	}
 
 	if h.Pool == nil {
@@ -77,27 +108,27 @@ func (h *Handlers) applyPreviewMutation(ctx context.Context, sandboxID, teamID u
 	}
 	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
-		return 0, nil, err
+		return previewPolicySnapshot{}, err
 	}
 	defer tx.Rollback(ctx)
-	revision, ports, err := run(h.DB.WithTx(tx))
+	policy, err := run(h.DB.WithTx(tx))
 	if err != nil {
-		return 0, nil, err
+		return previewPolicySnapshot{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, nil, err
+		return previewPolicySnapshot{}, err
 	}
-	return revision, ports, nil
+	return policy, nil
 }
 
-func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, ports map[int32]struct{}, revision int64) error {
+func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, policy previewPolicySnapshot) error {
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		return fmt.Errorf("resolve vmd: %w", err)
 	}
 	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
 	defer cancel()
-	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), sandbox.PreviewAccess, ports, revision)
+	err = vmd.UpdateSandboxPreviewPolicy(vmdCtx, sandbox.ID.String(), policy.Access, policy.Ports, policy.Revision)
 	if status.Code(err) == codes.NotFound {
 		return nil
 	}
@@ -105,13 +136,15 @@ func (h *Handlers) pushPreviewPolicy(ctx context.Context, sandbox db.Sandbox, po
 }
 
 func (h *Handlers) requireHostPreviewPorts(c *gin.Context, hostID string) bool {
-	host, err := h.DB.GetHost(c.Request.Context(), hostID)
-	if err != nil && err != pgx.ErrNoRows {
-		log.Error().Err(err).Str("host_id", hostID).Msg("DB GetHost failed")
+	hasCapability, err := h.DB.HostHasCapability(c.Request.Context(), db.HostHasCapabilityParams{
+		HostID: hostID, Capability: preview.HostCapabilityPorts,
+	})
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("DB HostHasCapability failed")
 		respondError(c, ErrInternal)
 		return false
 	}
-	if err == pgx.ErrNoRows || !slices.Contains(host.Capabilities, preview.HostCapabilityPorts) {
+	if !hasCapability {
 		respondErrorMsg(c, "conflict",
 			fmt.Sprintf("The sandbox's host does not enforce %q; retry after the fleet is upgraded", preview.HostCapabilityPorts),
 			http.StatusConflict)
@@ -150,8 +183,14 @@ func (h *Handlers) ListSandboxPreviewPorts(c *gin.Context) {
 	if !h.requireTeamSandboxRead(c, teamID) {
 		return
 	}
-	sandbox, ok := h.getTeamSandbox(c, sandboxID, teamID)
+	_, ok := h.getTeamSandbox(c, sandboxID, teamID)
 	if !ok {
+		return
+	}
+	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
 		return
 	}
 	rows, err := h.DB.ListPublishedPorts(c.Request.Context(), sandboxID)
@@ -164,7 +203,7 @@ func (h *Handlers) ListSandboxPreviewPorts(c *gin.Context) {
 	for _, port := range rows {
 		ports = append(ports, publishedPortResponse{Port: port})
 	}
-	c.JSON(http.StatusOK, listPreviewPortsResponse{PreviewAccess: sandbox.PreviewAccess, Ports: ports})
+	c.JSON(http.StatusOK, listPreviewPortsResponse{PreviewAccess: policy.Access, Ports: ports})
 }
 
 type publishPortRequest struct {
@@ -198,12 +237,12 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 	}
 
 	var port int32
-	revision, ports, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
+	policy, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
 		var mutationErr error
 		port, mutationErr = q.PublishPort(c.Request.Context(), db.PublishPortParams{SandboxID: sandboxID, Port: body.Port})
 		return mutationErr
 	})
-	if !h.handlePreviewMutationResult(c, sandboxID, "PublishPort", err) || !h.pushAfterPreviewMutation(c, sandbox, ports, revision) {
+	if !h.handlePreviewMutationResult(c, sandboxID, "PublishPort", err) || !h.pushAfterPreviewMutation(c, sandbox, policy) {
 		return
 	}
 
@@ -238,12 +277,12 @@ func (h *Handlers) UnpublishSandboxPreviewPort(c *gin.Context) {
 	}
 
 	var deleted int64
-	revision, ports, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
+	policy, err := h.applyPreviewMutation(c.Request.Context(), sandboxID, teamID, func(q *db.Queries) error {
 		var mutationErr error
 		deleted, mutationErr = q.UnpublishPort(c.Request.Context(), db.UnpublishPortParams{SandboxID: sandboxID, Port: port})
 		return mutationErr
 	})
-	if !h.handlePreviewMutationResult(c, sandboxID, "UnpublishPort", err) || !h.pushAfterPreviewMutation(c, sandbox, ports, revision) {
+	if !h.handlePreviewMutationResult(c, sandboxID, "UnpublishPort", err) || !h.pushAfterPreviewMutation(c, sandbox, policy) {
 		return
 	}
 	if deleted > 0 {
@@ -267,8 +306,8 @@ func (h *Handlers) handlePreviewMutationResult(c *gin.Context, sandboxID uuid.UU
 	return false
 }
 
-func (h *Handlers) pushAfterPreviewMutation(c *gin.Context, sandbox db.Sandbox, ports map[int32]struct{}, revision int64) bool {
-	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, ports, revision); err != nil {
+func (h *Handlers) pushAfterPreviewMutation(c *gin.Context, sandbox db.Sandbox, policy previewPolicySnapshot) bool {
+	if err := h.pushPreviewPolicy(c.Request.Context(), sandbox, policy); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("push preview policy failed; retry to converge")
 		respondError(c, ErrInternal)
 		return false

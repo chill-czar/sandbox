@@ -13,4 +13,10 @@ const (
 	// HostCapabilityPorts is advertised by a vmd/proxy build that persists and
 	// enforces the explicit published-port allowlist.
 	HostCapabilityPorts = "preview_ports_v1"
+
+	// ProxyProtocolHeader marks local instance lookups made by a proxy that
+	// understands and enforces HostCapabilityPorts. VMD withholds strict-policy
+	// instances from callers that omit the marker so rolling the proxy back
+	// cannot silently restore all-port routing.
+	ProxyProtocolHeader = "X-Superserve-Proxy-Protocol"
 )
