@@ -126,6 +126,10 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// This response attestation lets a new proxy distinguish an explicitly
+	// legacy sandbox served by a capable VMD from a response emitted by a VMD
+	// that predates publication policy fields entirely.
+	w.Header().Set(preview.VMDProtocolHeader, preview.HostCapabilityPorts)
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(instanceResponse{
 		VMIP:          info.VMIP,

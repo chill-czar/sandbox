@@ -7,6 +7,8 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/preview"
 	bolt "go.etcd.io/bbolt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestPreviewPolicyRecordRoundTrip(t *testing.T) {
@@ -88,6 +90,96 @@ func TestUpdateSandboxPreviewPolicyRejectsStaleRevision(t *testing.T) {
 	delete(incoming, 5000)
 	if _, ok := inst.PreviewPorts[5000]; !ok {
 		t.Fatal("manager retained caller-owned preview port map")
+	}
+}
+
+func TestUpdateSandboxPreviewPolicyEqualRevisionIsIdempotent(t *testing.T) {
+	tests := []struct {
+		name           string
+		storedAccess   string
+		incomingAccess string
+		storedPorts    map[int32]struct{}
+		incomingPorts  map[int32]struct{}
+	}{
+		{
+			name:           "create revision zero attestation",
+			storedAccess:   preview.AccessPublic,
+			incomingAccess: preview.AccessPublic,
+		},
+		{
+			name:           "legacy zero value is normalized",
+			storedAccess:   "",
+			incomingAccess: preview.AccessLegacyPublic,
+		},
+		{
+			name:           "full port set matches independent map",
+			storedAccess:   preview.AccessPublic,
+			incomingAccess: preview.AccessPublic,
+			storedPorts:    map[int32]struct{}{3000: {}, 8080: {}},
+			incomingPorts:  map[int32]struct{}{8080: {}, 3000: {}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inst := &VMInstance{
+				ID:                    "vm-preview",
+				PreviewAccess:         tt.storedAccess,
+				PreviewPorts:          tt.storedPorts,
+				PreviewPolicyRevision: 0,
+			}
+			mgr := &Manager{vms: map[string]*VMInstance{inst.ID: inst}}
+
+			if err := mgr.UpdateSandboxPreviewPolicy(inst.ID, tt.incomingAccess, tt.incomingPorts, 0); err != nil {
+				t.Fatalf("idempotent update: %v", err)
+			}
+			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, tt.storedAccess, tt.storedPorts) {
+				t.Fatalf("idempotent update changed stored policy to (%q, %#v)", inst.PreviewAccess, inst.PreviewPorts)
+			}
+		})
+	}
+}
+
+func TestUpdateSandboxPreviewPolicyEqualRevisionMismatchFailsClosed(t *testing.T) {
+	tests := []struct {
+		name           string
+		storedAccess   string
+		incomingAccess string
+		storedPorts    map[int32]struct{}
+		incomingPorts  map[int32]struct{}
+	}{
+		{
+			name:           "create revision zero cannot attest legacy instance",
+			storedAccess:   "",
+			incomingAccess: preview.AccessPublic,
+		},
+		{
+			name:           "different full port set",
+			storedAccess:   preview.AccessPublic,
+			incomingAccess: preview.AccessPublic,
+			storedPorts:    map[int32]struct{}{3000: {}},
+			incomingPorts:  map[int32]struct{}{8080: {}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inst := &VMInstance{
+				ID:                    "vm-preview",
+				PreviewAccess:         tt.storedAccess,
+				PreviewPorts:          tt.storedPorts,
+				PreviewPolicyRevision: 0,
+			}
+			mgr := &Manager{vms: map[string]*VMInstance{inst.ID: inst}}
+
+			err := mgr.UpdateSandboxPreviewPolicy(inst.ID, tt.incomingAccess, tt.incomingPorts, 0)
+			if status.Code(err) != codes.FailedPrecondition {
+				t.Fatalf("mismatched equal revision error = %v, want FailedPrecondition", err)
+			}
+			if inst.PreviewAccess != tt.storedAccess || !previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, tt.storedAccess, tt.storedPorts) {
+				t.Fatalf("rejected update changed stored policy to (%q, %#v)", inst.PreviewAccess, inst.PreviewPorts)
+			}
+		})
 	}
 }
 

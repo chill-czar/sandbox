@@ -29,6 +29,9 @@ func TestPreviewPublicationMigrationPreservesRollingScannerShapes(t *testing.T) 
 			t.Errorf("migration alters existing %s row shape, which breaks old SELECT */RETURNING * scanners", existingTable)
 		}
 	}
+	if !strings.Contains(sql, "port <> 49983") {
+		t.Fatal("published-port constraint permits boxd's reserved port 49983")
+	}
 }
 
 func TestMissingPreviewPolicyRowRemainsLegacyPublic(t *testing.T) {

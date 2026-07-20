@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,7 +15,11 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
-func TestVMDResolverMarksLookupAndDecodesLegacyResponse(t *testing.T) {
+func attestPreviewProtocol(w http.ResponseWriter) {
+	w.Header().Set(preview.VMDProtocolHeader, preview.HostCapabilityPorts)
+}
+
+func TestVMDResolverRejectsOldVMDResponseWithoutProtocolAttestation(t *testing.T) {
 	var gotHeader, gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotHeader = r.Header.Get(preview.ProxyProtocolHeader)
@@ -29,15 +34,36 @@ func TestVMDResolverMarksLookupAndDecodesLegacyResponse(t *testing.T) {
 	}))
 	defer server.Close()
 
-	info, err := NewVMDResolver(server.URL).Lookup(context.Background(), "vm-legacy")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
+	_, err := NewVMDResolver(server.URL).Lookup(context.Background(), "vm-strict-on-old-vmd")
+	if !errors.Is(err, ErrVMDPreviewProtocolUnsupported) {
+		t.Fatalf("Lookup error = %v, want ErrVMDPreviewProtocolUnsupported", err)
 	}
-	if gotPath != "/instances/vm-legacy" {
-		t.Fatalf("path = %q, want /instances/vm-legacy", gotPath)
+	if gotPath != "/instances/vm-strict-on-old-vmd" {
+		t.Fatalf("path = %q, want /instances/vm-strict-on-old-vmd", gotPath)
 	}
 	if gotHeader != preview.HostCapabilityPorts {
 		t.Fatalf("%s = %q, want %q", preview.ProxyProtocolHeader, gotHeader, preview.HostCapabilityPorts)
+	}
+	if got := err.Error(); !strings.Contains(got, preview.VMDProtocolHeader) {
+		t.Fatalf("error %q does not identify missing protocol header", got)
+	}
+}
+
+func TestVMDResolverAcceptsAttestedLegacyResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attestPreviewProtocol(w)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"vm_ip":      "10.0.0.2",
+			"status":     "running",
+			"started_at": int64(123),
+		})
+	}))
+	defer server.Close()
+
+	info, err := NewVMDResolver(server.URL).Lookup(context.Background(), "vm-legacy")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
 	}
 	if info.VMIP != "10.0.0.2" || info.PreviewAccess != "" || info.PreviewPorts != nil {
 		t.Fatalf("legacy response decoded as %#v", info)
@@ -47,6 +73,7 @@ func TestVMDResolverMarksLookupAndDecodesLegacyResponse(t *testing.T) {
 func TestVMDResolverDoesNotCacheSuccessfulPolicy(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attestPreviewProtocol(w)
 		call := calls.Add(1)
 		ports := map[string]bool{"3000": true}
 		if call > 1 {
@@ -98,6 +125,7 @@ func TestVMDResolverInvalidateStartsFreshLookupDuringInflightSuccess(t *testing.
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attestPreviewProtocol(w)
 		call := calls.Add(1)
 		port := "8080"
 		if call == 1 {
@@ -215,6 +243,7 @@ func TestVMDResolverInflightMissCannotReinsertAfterInvalidate(t *testing.T) {
 			http.Error(w, "old instance miss", http.StatusNotFound)
 			return
 		}
+		attestPreviewProtocol(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"vm_ip":          "10.0.0.2",

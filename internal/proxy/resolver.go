@@ -19,6 +19,11 @@ import (
 // ErrInstanceNotFound is returned when the resolver has no record of the instance.
 var ErrInstanceNotFound = errors.New("proxy: instance not found")
 
+// ErrVMDPreviewProtocolUnsupported is returned when a successful lookup lacks
+// proof that VMD understands preview publication. Treating that response as a
+// legacy sandbox would expose strict sandboxes during a VMD rollback.
+var ErrVMDPreviewProtocolUnsupported = errors.New("proxy: vmd does not attest preview publication protocol")
+
 // InstanceInfo holds the routing information for a sandbox instance.
 type InstanceInfo struct {
 	VMIP          string
@@ -167,6 +172,9 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	}
 	if resp.StatusCode != http.StatusOK {
 		return InstanceInfo{}, fmt.Errorf("resolver: vmd returned %d for instance %s", resp.StatusCode, instanceID)
+	}
+	if got := resp.Header.Get(preview.VMDProtocolHeader); got != preview.HostCapabilityPorts {
+		return InstanceInfo{}, fmt.Errorf("%w: %s=%q", ErrVMDPreviewProtocolUnsupported, preview.VMDProtocolHeader, got)
 	}
 
 	var raw vmdResponse

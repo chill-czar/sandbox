@@ -26,6 +26,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/presence"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
@@ -2460,6 +2461,25 @@ func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
 	return out
 }
 
+func normalizedPreviewAccess(access string) string {
+	if access == "" {
+		return preview.AccessLegacyPublic
+	}
+	return access
+}
+
+func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB string, portsB map[int32]struct{}) bool {
+	if normalizedPreviewAccess(accessA) != normalizedPreviewAccess(accessB) || len(portsA) != len(portsB) {
+		return false
+	}
+	for port := range portsA {
+		if _, ok := portsB[port]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // previewPolicyForRestore merges incoming wire policy with any policy already
 // known for this VM. Revisions identify immutable snapshots, so existing state
 // wins equality. The durable sidecar is considered after memory and therefore
@@ -2499,17 +2519,26 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 }
 
 // UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
-// record. Revisions are monotonic; stale/reordered snapshots are harmlessly
-// ignored so they cannot reopen an unpublished port.
+// record. Revisions are monotonic; older snapshots are harmlessly ignored, and
+// an equal revision is idempotent only when its complete policy is identical.
 func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err
 	}
 	inst.mu.Lock()
-	if revision <= inst.PreviewPolicyRevision {
+	if revision < inst.PreviewPolicyRevision {
 		inst.mu.Unlock()
 		return nil
+	}
+	if revision == inst.PreviewPolicyRevision {
+		equal := previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, previewAccess, previewPorts)
+		inst.mu.Unlock()
+		if equal {
+			return nil
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"preview policy revision %d conflicts with the policy already stored for vm %s", revision, vmID)
 	}
 	nextPorts := clonePreviewPorts(previewPorts)
 	// Keep the instance lock through persistence. Otherwise two concurrent

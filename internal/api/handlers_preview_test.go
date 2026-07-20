@@ -269,6 +269,52 @@ func TestPublishPreviewPortUsesStrictRequestShape(t *testing.T) {
 	}
 }
 
+func TestPreviewPortMutationsRejectReservedBoxdPortBeforeDB(t *testing.T) {
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			return errorRow(fmt.Errorf("DB must not be called: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			return pgconn.CommandTag{}, fmt.Errorf("DB must not be called: %s", sql)
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+	sandboxID, teamID := uuid.New(), uuid.New()
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name:   "publish",
+			method: http.MethodPost,
+			path:   "/sandboxes/" + sandboxID.String() + "/preview-ports",
+			body:   fmt.Sprintf(`{"port":%d}`, preview.ReservedBoxdPort),
+		},
+		{
+			name:   "unpublish",
+			method: http.MethodDelete,
+			path:   fmt.Sprintf("/sandboxes/%s/preview-ports/%d", sandboxID, preview.ReservedBoxdPort),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			setupPreviewRouter(h, teamID.String()).ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body: %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "reserved") {
+				t.Fatalf("body = %q, want reserved-port explanation", w.Body.String())
+			}
+		})
+	}
+}
+
 func TestUnpublishPreviewPortRetryRepushesFullAllowlist(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{

@@ -3039,7 +3039,7 @@ type UpdateSandboxPreviewPolicyRequest struct {
 	VmId           string                 `protobuf:"bytes,1,opt,name=vm_id,json=vmId,proto3" json:"vm_id,omitempty"`
 	PreviewAccess  string                 `protobuf:"bytes,2,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`     // "legacy_public" | "public"
 	PreviewPorts   []*PreviewPort         `protobuf:"bytes,3,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`        // full replacement allowlist
-	PolicyRevision int64                  `protobuf:"varint,4,opt,name=policy_revision,json=policyRevision,proto3" json:"policy_revision,omitempty"` // monotonic; <= current is ignored
+	PolicyRevision int64                  `protobuf:"varint,4,opt,name=policy_revision,json=policyRevision,proto3" json:"policy_revision,omitempty"` // monotonic; equal must match exactly
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }

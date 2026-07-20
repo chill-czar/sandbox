@@ -526,7 +526,7 @@ message UpdateSandboxPreviewPolicyRequest {
   string vm_id = 1;
   string preview_access = 2;              // "legacy_public" | "public"
   repeated PreviewPort preview_ports = 3; // full replacement allowlist
-  int64 policy_revision = 4;              // monotonic; <= current is ignored
+  int64 policy_revision = 4;              // monotonic; equal must match exactly
 }
 
 message UpdateSandboxPreviewPolicyResponse {

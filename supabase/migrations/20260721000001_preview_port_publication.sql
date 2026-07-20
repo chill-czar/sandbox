@@ -25,7 +25,8 @@ CREATE TABLE sandbox_published_port (
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (sandbox_id, port),
-    CONSTRAINT sandbox_published_port_range CHECK (port >= 1024 AND port <= 65535)
+    CONSTRAINT sandbox_published_port_range
+        CHECK (port >= 1024 AND port <= 65535 AND port <> 49983)
 );
 
 COMMENT ON TABLE sandbox_published_port IS

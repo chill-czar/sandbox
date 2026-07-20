@@ -18,11 +18,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/preview"
 )
 
-const (
-	minPreviewPort = 1024
-	maxPreviewPort = 65535
-)
-
 func validatePreviewAccess(value *string) error {
 	if value == nil || *value == preview.AccessPublic {
 		return nil
@@ -155,11 +150,16 @@ func (h *Handlers) requireHostPreviewPorts(c *gin.Context, hostID string) bool {
 
 func parsePreviewPort(c *gin.Context) (int32, bool) {
 	port, err := strconv.Atoi(c.Param("port"))
-	if err != nil || port < minPreviewPort || port > maxPreviewPort {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("port must be an integer in [%d, %d]", minPreviewPort, maxPreviewPort), http.StatusBadRequest)
+	if err != nil || port < int(preview.MinPublishedPort) || port > int(preview.MaxPublishedPort) {
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("port must be an integer in [%d, %d]", preview.MinPublishedPort, preview.MaxPublishedPort), http.StatusBadRequest)
 		return 0, false
 	}
-	return int32(port), true
+	parsed := int32(port)
+	if err := preview.ValidatePublishedPort(parsed); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return 0, false
+	}
+	return parsed, true
 }
 
 type publishedPortResponse struct {
@@ -227,8 +227,8 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if body.Port < minPreviewPort || body.Port > maxPreviewPort {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("port must be an integer in [%d, %d]", minPreviewPort, maxPreviewPort), http.StatusBadRequest)
+	if err := preview.ValidatePublishedPort(body.Port); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 	sandbox, ok := h.getTeamSandbox(c, sandboxID, teamID)

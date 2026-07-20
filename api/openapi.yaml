@@ -1926,7 +1926,9 @@ components:
         type: integer
         minimum: 1024
         maximum: 65535
-      description: Published sandbox port.
+        not:
+          enum: [49983]
+      description: Published sandbox port. Port 49983 is reserved for Superserve's sandbox service.
 
     TemplateId:
       name: template_id
@@ -2597,7 +2599,9 @@ components:
           type: integer
           minimum: 1024
           maximum: 65535
-          description: Public port to publish.
+          not:
+            enum: [49983]
+          description: Public port to publish. Port 49983 is reserved for Superserve's sandbox service.
 
     PreviewPort:
       type: object
@@ -2607,7 +2611,9 @@ components:
           type: integer
           minimum: 1024
           maximum: 65535
-          description: Published public port.
+          not:
+            enum: [49983]
+          description: Published public port. Port 49983 is reserved for Superserve's sandbox service.
 
     PreviewPortList:
       type: object

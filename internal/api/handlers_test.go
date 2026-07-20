@@ -1732,6 +1732,7 @@ func TestCreateSandbox_PreviewAttestationFailureFailsClosed(t *testing.T) {
 	}{
 		{name: "old vmd unimplemented", err: status.Error(codes.Unimplemented, "unknown method UpdateSandboxPreviewPolicy")},
 		{name: "policy update failed", err: status.Error(codes.Internal, "policy persistence failed")},
+		{name: "revision zero policy mismatch", err: status.Error(codes.FailedPrecondition, "revision zero conflicts with stored policy")},
 	}
 
 	for _, tt := range tests {

@@ -379,8 +379,8 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]struct{}, error) 
 	out := make(map[int32]struct{}, len(in))
 	for _, item := range in {
 		port := item.GetPort()
-		if port < 1024 || port > 65535 {
-			return nil, status.Errorf(codes.InvalidArgument, "preview port out of range: %d", port)
+		if err := preview.ValidatePublishedPort(port); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid preview port %d: %v", port, err)
 		}
 		if _, duplicate := out[port]; duplicate {
 			return nil, status.Errorf(codes.InvalidArgument, "duplicate preview port: %d", port)

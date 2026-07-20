@@ -36,6 +36,9 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("legacy instance %q status = %d, want 200", instanceID, w.Code)
 		}
+		if got := w.Header().Get(preview.VMDProtocolHeader); got != preview.HostCapabilityPorts {
+			t.Fatalf("legacy instance %q %s = %q, want %q", instanceID, preview.VMDProtocolHeader, got, preview.HostCapabilityPorts)
+		}
 	}
 
 	w := httptest.NewRecorder()
@@ -44,6 +47,9 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("unmarked strict lookup status = %d, want 404", w.Code)
 	}
+	if got := w.Header().Get(preview.VMDProtocolHeader); got != "" {
+		t.Fatalf("rejected strict lookup attested protocol with %q", got)
+	}
 
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/instances/strict", nil)
@@ -51,6 +57,9 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 	srv.handleInstance(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("marked strict lookup status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(preview.VMDProtocolHeader); got != preview.HostCapabilityPorts {
+		t.Fatalf("strict lookup %s = %q, want %q", preview.VMDProtocolHeader, got, preview.HostCapabilityPorts)
 	}
 	var got instanceResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
