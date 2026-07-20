@@ -19,6 +19,9 @@ func TestPreviewPublicationMigrationPreservesRollingScannerShapes(t *testing.T) 
 		if !strings.Contains(sql, "CREATE TABLE "+table) {
 			t.Errorf("migration does not create %s side table", table)
 		}
+		if !strings.Contains(sql, "ALTER TABLE public."+table+" ENABLE ROW LEVEL SECURITY") {
+			t.Errorf("migration does not protect %s with row-level security", table)
+		}
 	}
 	for _, existingTable := range []string{"sandbox", "host"} {
 		pattern := regexp.MustCompile(`(?is)ALTER\s+TABLE\s+(?:public\.)?` + existingTable + `\b`)

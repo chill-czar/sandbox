@@ -43,6 +43,13 @@ CREATE TABLE host_capability (
         CHECK (capability <> '' AND octet_length(capability) <= 64)
 );
 
+-- These are internal control-plane tables in Supabase's API-exposed public
+-- schema. With RLS enabled and no client policies, only the privileged backend
+-- role can change routing policy or forge a live host capability attestation.
+ALTER TABLE public.sandbox_preview_policy ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.sandbox_published_port ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.host_capability ENABLE ROW LEVEL SECURITY;
+
 COMMENT ON TABLE host_capability IS
     'Data-plane capabilities jointly advertised by the currently running host services. '
     'heartbeat_at must match host.last_heartbeat_at, so an old control-plane '
