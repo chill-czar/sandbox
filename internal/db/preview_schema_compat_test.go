@@ -9,7 +9,7 @@ import (
 )
 
 func TestPreviewPublicationMigrationPreservesRollingScannerShapes(t *testing.T) {
-	path := filepath.Join("..", "..", "supabase", "migrations", "20260714000001_preview_port_publication.sql")
+	path := filepath.Join("..", "..", "supabase", "migrations", "20260721000001_preview_port_publication.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
