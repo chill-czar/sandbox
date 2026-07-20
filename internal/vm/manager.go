@@ -106,10 +106,10 @@ type VMInstance struct {
 	OwnerID      string // creating user; empty when unknown
 
 	// PreviewAccess and PreviewPorts are the data-plane publication policy.
-	// Empty/legacy_public preserves historical all-port routing; public requires
-	// membership in the allowlist. The revision rejects stale full-set pushes.
+	// Empty/legacy_public preserves historical all-port routing; strict modes
+	// require membership in the allowlist. The revision rejects stale pushes.
 	PreviewAccess         string
-	PreviewPorts          map[int32]struct{}
+	PreviewPorts          map[int32]PreviewPortPolicy
 	PreviewPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
@@ -125,6 +125,12 @@ type VMInstance struct {
 	DirtyTracked bool
 
 	mu sync.RWMutex
+}
+
+// PreviewPortPolicy is the VMD representation of one published port. Access
+// is empty for a Phase 1 sender and then inherits PreviewAccess.
+type PreviewPortPolicy struct {
+	Access string
 }
 
 // VMConfig describes the desired configuration for a VM.
@@ -1476,7 +1482,7 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64,
 ) (*VMInstance, error) {
 	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
@@ -1541,7 +1547,7 @@ func psiSomeAvg10(path string) float64 {
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
-	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, recordToPath string,
+	previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -2419,7 +2425,7 @@ type InstanceInfo struct {
 	OwnerID   string
 
 	PreviewAccess string
-	PreviewPorts  map[int32]struct{}
+	PreviewPorts  map[int32]PreviewPortPolicy
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2436,6 +2442,7 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		}
 	}
 	inst.mu.RLock()
+	previewAccess := restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts)
 	info := InstanceInfo{
 		VMIP:      inst.IP,
 		Status:    inst.Status,
@@ -2443,20 +2450,20 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
 
-		PreviewAccess: inst.PreviewAccess,
+		PreviewAccess: previewAccess,
 		PreviewPorts:  clonePreviewPorts(inst.PreviewPorts),
 	}
 	inst.mu.RUnlock()
 	return info, true
 }
 
-func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
+func clonePreviewPorts(in map[int32]PreviewPortPolicy) map[int32]PreviewPortPolicy {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make(map[int32]struct{}, len(in))
-	for port := range in {
-		out[port] = struct{}{}
+	out := make(map[int32]PreviewPortPolicy, len(in))
+	for port, policy := range in {
+		out[port] = policy
 	}
 	return out
 }
@@ -2468,12 +2475,13 @@ func normalizedPreviewAccess(access string) string {
 	return access
 }
 
-func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB string, portsB map[int32]struct{}) bool {
+func previewPolicyEqual(accessA string, portsA map[int32]PreviewPortPolicy, accessB string, portsB map[int32]PreviewPortPolicy) bool {
 	if normalizedPreviewAccess(accessA) != normalizedPreviewAccess(accessB) || len(portsA) != len(portsB) {
 		return false
 	}
-	for port := range portsA {
-		if _, ok := portsB[port]; !ok {
+	for port, policyA := range portsA {
+		policyB, ok := portsB[port]
+		if !ok || policyA.Access != policyB.Access {
 			return false
 		}
 	}
@@ -2485,8 +2493,8 @@ func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB strin
 // wins equality. The durable sidecar is considered after memory and therefore
 // wins an equal-revision disagreement caused by an old VMD rewriting only the
 // primary lifecycle JSON.
-func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]struct{}, incomingRevision int64) (string, map[int32]struct{}, int64, error) {
-	access := incomingAccess
+func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]PreviewPortPolicy, incomingRevision int64) (string, map[int32]PreviewPortPolicy, int64, error) {
+	access := restrictivePreviewAccess(incomingAccess, incomingPorts)
 	ports := clonePreviewPorts(incomingPorts)
 	revision := incomingRevision
 
@@ -2495,7 +2503,7 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 	m.mu.RUnlock()
 	if inst != nil {
 		inst.mu.RLock()
-		existingAccess := inst.PreviewAccess
+		existingAccess := restrictivePreviewAccess(inst.PreviewAccess, inst.PreviewPorts)
 		existingPorts := clonePreviewPorts(inst.PreviewPorts)
 		existingRevision := inst.PreviewPolicyRevision
 		inst.mu.RUnlock()
@@ -2510,8 +2518,8 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 			return "", nil, 0, err
 		}
 		if rec != nil && rec.PreviewPolicyRevision >= revision {
-			access = rec.PreviewAccess
-			ports = previewPortsFromRecord(rec.PreviewPorts)
+			ports = previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess)
+			access = restrictivePreviewAccess(rec.PreviewAccess, ports)
 			revision = rec.PreviewPolicyRevision
 		}
 	}
@@ -2521,7 +2529,7 @@ func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingP
 // UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
 // record. Revisions are monotonic; older snapshots are harmlessly ignored, and
 // an equal revision is idempotent only when its complete policy is identical.
-func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]PreviewPortPolicy, revision int64) error {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return err
@@ -2541,6 +2549,7 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 			"preview policy revision %d conflicts with the policy already stored for vm %s", revision, vmID)
 	}
 	nextPorts := clonePreviewPorts(previewPorts)
+	previewAccess = restrictivePreviewAccess(previewAccess, nextPorts)
 	// Keep the instance lock through persistence. Otherwise two concurrent
 	// RPCs can apply revisions in order but race their BoltDB writes in reverse,
 	// resurrecting the stale policy after a vmd restart. Persist the intended
@@ -2550,6 +2559,7 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 		record := toRecordLocked(inst)
 		record.PreviewAccess = previewAccess
 		record.PreviewPorts = previewPortsToRecord(nextPorts)
+		record.PreviewPortAccess = previewPortAccessToRecord(nextPorts)
 		record.PreviewPolicyRevision = revision
 		if err := m.state.Put(record); err != nil {
 			inst.mu.Unlock()
@@ -2561,6 +2571,14 @@ func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, preview
 	inst.PreviewPolicyRevision = revision
 	inst.mu.Unlock()
 	return nil
+}
+
+func restrictivePreviewAccess(sandboxAccess string, ports map[int32]PreviewPortPolicy) string {
+	accesses := make([]string, 0, len(ports))
+	for _, policy := range ports {
+		accesses = append(accesses, policy.Access)
+	}
+	return preview.RestrictiveFallback(sandboxAccess, accesses...)
 }
 
 // ---------------------------------------------------------------------------

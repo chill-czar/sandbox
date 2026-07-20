@@ -56,7 +56,7 @@ func (h *Handlers) respondQuotaExceeded(c *gin.Context, teamID uuid.UUID) {
 
 // Scheduler selects a host for new sandboxes.
 type Scheduler interface {
-	SelectHost(ctx context.Context) (hostID string, err error)
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
 }
 
 // HostRegistry resolves a host ID to a VMD client.
@@ -475,7 +475,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+	resumeVMDAccess := resumePolicy.vmdAccess()
+	if resumeVMDAccess == preview.AccessPrivate {
+		if !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
+			return false
+		}
+	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
 		return false
 	}
 
@@ -587,7 +592,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumePolicy.Access, resumePolicy.Ports, resumePolicy.Revision, nil)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.Ports, resumePolicy.Revision, nil)
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
 				revertToPaused()
@@ -670,8 +675,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.Access, currentPolicy.Ports, currentPolicy.Revision); policyErr != nil {
-		if currentPolicy.Access == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
+	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.Ports, currentPolicy.Revision); policyErr != nil {
+		if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
 			// Legacy sandboxes remain compatible with a VMD from before policy
 			// updates existed. Strict resumes were capability-gated above and may
 			// never take this fallback.
@@ -1214,8 +1219,8 @@ type createSandboxRequest struct {
 	// per-binding proxy token, swapped for the real value at egress.
 	Secrets map[string]string `json:"secrets,omitempty"`
 
-	// PreviewAccess is currently only "public": new sandboxes default to the
-	// strict explicitly-published-port model. legacy_public is migration-only.
+	// PreviewAccess selects the default for newly published ports. New sandboxes
+	// default to public; legacy_public is compatibility-only and cannot be set.
 	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
@@ -1609,6 +1614,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	previewAccess := preview.AccessPublic
+	if req.PreviewAccess != nil {
+		previewAccess = *req.PreviewAccess
+	}
 	if err := validateSecretsRefs(req.Secrets); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
@@ -1707,8 +1716,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Select a host for this sandbox.
 	var hostID string
+	requiredCapabilities := []string{preview.HostCapabilityPorts}
+	if previewAccess == preview.AccessPrivate {
+		requiredCapabilities = append(requiredCapabilities, preview.HostCapabilityPortAccess)
+	}
 	if h.Scheduler != nil {
-		hostID, err = h.Scheduler.SelectHost(c.Request.Context())
+		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
 		if err != nil {
 			log.Error().Err(err).Msg("scheduler SelectHost failed")
 			respondErrorMsg(c, "service_unavailable", "No hosts available", http.StatusServiceUnavailable)
@@ -1721,9 +1734,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	SetTelemetryHostID(c, hostID)
 
-	// Every new sandbox starts strict, so it can only be placed on a host that
-	// advertises publication enforcement. This happens before DB/VM creation.
-	if !h.requireHostPreviewPorts(c, hostID) {
+	// Re-attest after placement. The scheduler cache and the default-host path
+	// are only hints; heartbeat capability state can change between selection
+	// and VM creation.
+	if previewAccess == preview.AccessPrivate {
+		if !h.requireHostPreviewPortAccess(c, hostID) {
+			return
+		}
+	} else if !h.requireHostPreviewPorts(c, hostID) {
 		return
 	}
 
@@ -1807,7 +1825,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 			if err := q.CreateSandboxPreviewPolicy(insertCtx, db.CreateSandboxPreviewPolicyParams{
 				SandboxID: sandboxID,
-				Access:    preview.AccessPublic,
+				Access:    previewAccess,
 			}); err != nil {
 				return db.Sandbox{}, fmt.Errorf("insert preview policy: %w", err)
 			}
@@ -1875,7 +1893,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), preview.AccessPublic, nil, 0, req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars)
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -1964,7 +1982,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// create a legacy/all-port VM. The new RPC is deliberately required even
 	// for initial revision zero. Do this before env injection or any 201-visible
 	// side effects so failure tears the VM down without exposing it.
-	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), preview.AccessPublic, nil, 0); err != nil {
+	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), previewAccess, nil, 0); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
 		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
 		respondError(c, ErrInternal)
@@ -2100,7 +2118,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
-	resp.PreviewAccess = preview.AccessPublic
+	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -2610,7 +2628,7 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.PreviewAccess != nil {
-		if !h.applyPreviewAccessPatch(c, sandbox, teamID) {
+		if !h.applyPreviewAccessPatch(c, sandbox, teamID, *body.PreviewAccess) {
 			return
 		}
 	}
@@ -2618,15 +2636,15 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID) bool {
-	if !h.requireHostPreviewPorts(c, sandbox.HostID) {
+func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
+	if !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
 		return false
 	}
 	var updated int64
 	policy, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
 		var mutationErr error
 		updated, mutationErr = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
-			SandboxID: sandbox.ID, Access: preview.AccessPublic, TeamID: teamID,
+			SandboxID: sandbox.ID, DefaultAccess: access, TeamID: teamID,
 		})
 		return mutationErr
 	})
@@ -2640,9 +2658,9 @@ func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, t
 	if !h.pushAfterPreviewMutation(c, sandbox, policy) {
 		return false
 	}
-	detail, _ := json.Marshal(map[string]string{"preview_access": preview.AccessPublic})
+	detail, _ := json.Marshal(map[string]string{"preview_access": access})
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_access_updated", "success", &sandbox.Name, nil, detail)
-	h.capture(c, "sandbox_preview_access_updated", map[string]any{"sandbox_id": sandbox.ID.String(), "preview_access": preview.AccessPublic})
+	h.capture(c, "sandbox_preview_access_updated", map[string]any{"sandbox_id": sandbox.ID.String(), "preview_access": access})
 	return true
 }
 

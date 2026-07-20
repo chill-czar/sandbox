@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -14,15 +15,19 @@ import (
 )
 
 type queryCapture struct {
-	sql string
+	sql   string
+	args  [][]string
+	calls int
 }
 
 func (c *queryCapture) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec")
 }
 
-func (c *queryCapture) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+func (c *queryCapture) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	c.sql = sql
+	c.calls++
+	c.args = append(c.args, append([]string(nil), args[0].([]string)...))
 	return schedulerEmptyRows{}, nil
 }
 
@@ -49,7 +54,8 @@ func (schedulerEmptyRows) Conn() *pgx.Conn                              { return
 func TestLeastLoadedQueryExcludesHostsWithoutPreviewEnforcement(t *testing.T) {
 	capture := &queryCapture{}
 	s := &LeastLoaded{DB: db.New(capture), DefaultHostID: "fallback"}
-	got, err := s.SelectHost(context.Background())
+	required := []string{preview.HostCapabilityPorts}
+	got, err := s.SelectHost(context.Background(), required)
 	if err != nil {
 		t.Fatalf("SelectHost: %v", err)
 	}
@@ -57,8 +63,36 @@ func TestLeastLoadedQueryExcludesHostsWithoutPreviewEnforcement(t *testing.T) {
 		t.Fatalf("host = %q, want fallback", got)
 	}
 	if !strings.Contains(capture.sql, "FROM host_capability") ||
-		!strings.Contains(capture.sql, "hc.capability = '"+preview.HostCapabilityPorts+"'") ||
+		!strings.Contains(capture.sql, "FROM unnest(") ||
+		strings.Count(capture.sql, "NOT EXISTS") < 2 ||
 		!strings.Contains(capture.sql, "hc.heartbeat_at = h.last_heartbeat_at") {
-		t.Fatalf("scheduler query does not require %q capability:\n%s", preview.HostCapabilityPorts, capture.sql)
+		t.Fatalf("scheduler query does not require all current-heartbeat capabilities:\n%s", capture.sql)
+	}
+	if !reflect.DeepEqual(capture.args, [][]string{required}) {
+		t.Fatalf("query capabilities = %#v, want %#v", capture.args, [][]string{required})
+	}
+}
+
+func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
+	capture := &queryCapture{}
+	s := &LeastLoaded{DB: db.New(capture), DefaultHostID: "fallback"}
+	ctx := context.Background()
+
+	public := []string{preview.HostCapabilityPorts}
+	private := []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
+	for _, required := range [][]string{public, public, private, {
+		preview.HostCapabilityPorts, preview.HostCapabilityPortAccess, preview.HostCapabilityPorts,
+	}} {
+		if got, err := s.SelectHost(ctx, required); err != nil || got != "fallback" {
+			t.Fatalf("SelectHost(%v) = (%q, %v), want fallback", required, got, err)
+		}
+	}
+
+	if capture.calls != 2 {
+		t.Fatalf("query calls = %d, want 2 capability-specific cache fills", capture.calls)
+	}
+	wantPrivate := []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
+	if !reflect.DeepEqual(capture.args[1], wantPrivate) {
+		t.Fatalf("private requirements = %#v, want %#v", capture.args[1], wantPrivate)
 	}
 }

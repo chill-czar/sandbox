@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 
 // Scheduler selects a host for a new sandbox.
 type Scheduler interface {
-	SelectHost(ctx context.Context) (hostID string, err error)
+	SelectHost(ctx context.Context, requiredCapabilities []string) (hostID string, err error)
 }
 
 const defaultCacheTTL = 30 * time.Second
@@ -34,8 +36,12 @@ type LeastLoaded struct {
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
-	mu       sync.RWMutex
-	cached   []db.ListActiveHostsByLoadRow
+	mu    sync.RWMutex
+	cache map[string]hostCacheEntry
+}
+
+type hostCacheEntry struct {
+	hosts    []db.ListActiveHostsByLoadRow
 	cachedAt time.Time
 }
 
@@ -46,8 +52,8 @@ func (s *LeastLoaded) ttl() time.Duration {
 	return defaultCacheTTL
 }
 
-func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
-	hosts, err := s.loadHosts(ctx)
+func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, error) {
+	hosts, err := s.loadHosts(ctx, requiredCapabilities)
 	if err != nil {
 		return "", err
 	}
@@ -76,35 +82,51 @@ func (s *LeastLoaded) SelectHost(ctx context.Context) (string, error) {
 	return hosts[b].ID, nil
 }
 
-func (s *LeastLoaded) loadHosts(ctx context.Context) ([]db.ListActiveHostsByLoadRow, error) {
+func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) ([]db.ListActiveHostsByLoadRow, error) {
+	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
-		hosts := s.cached
+	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl() {
 		s.mu.RUnlock()
-		return hosts, nil
+		return entry.hosts, nil
 	}
 	s.mu.RUnlock()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cached != nil && time.Since(s.cachedAt) < s.ttl() {
-		return s.cached, nil
+	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl() {
+		return entry.hosts, nil
 	}
 
-	hosts, err := s.DB.ListActiveHostsByLoad(ctx)
+	hosts, err := s.DB.ListActiveHostsByLoad(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
 	}
-	s.cached = hosts
-	s.cachedAt = time.Now()
+	if s.cache == nil {
+		s.cache = make(map[string]hostCacheEntry)
+	}
+	s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
 	return hosts, nil
+}
+
+func capabilityCacheKey(capabilities []string) (string, []string) {
+	set := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		if capability != "" {
+			set[capability] = struct{}{}
+		}
+	}
+	normalized := make([]string, 0, len(set))
+	for capability := range set {
+		normalized = append(normalized, capability)
+	}
+	sort.Strings(normalized)
+	return strings.Join(normalized, "\x00"), normalized
 }
 
 // Invalidate drops the cached host list so the next SelectHost reflects
 // changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
-	s.cached = nil
-	s.cachedAt = time.Time{}
+	s.cache = nil
 	s.mu.Unlock()
 }
