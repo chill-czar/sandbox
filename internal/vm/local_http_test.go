@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,5 +164,64 @@ func TestLocalHTTPRequiresProxyProtocolForStrictInstance(t *testing.T) {
 	if got.PreviewPortAccess["3000"] != preview.AccessPrivateTokenV1 ||
 		got.PreviewPortTokenVersions["3000"] != 9 {
 		t.Fatalf("tokenized response = %#v", got)
+	}
+}
+
+func TestLocalHTTPRequiresCompleteBrowserProxyCapabilities(t *testing.T) {
+	const browserPort = int32(4173)
+	mgr := &Manager{vms: map[string]*VMInstance{
+		"browser": {
+			ID: "browser", Status: StatusRunning, IP: "10.0.0.8", CreatedAt: time.Unix(7, 0),
+			PreviewAccess: preview.AccessPrivate,
+			PreviewPorts: map[int32]PreviewPortPolicy{
+				browserPort: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 11},
+			},
+			PreviewPolicyRevision: 14, PreviewTokenPolicyRevision: 14,
+		},
+	}}
+	srv := NewLocalHTTPServer(mgr, zerolog.Nop())
+
+	tests := []struct {
+		name string
+		caps []string
+		want int
+	}{
+		{name: "no additive capabilities", want: http.StatusNotFound},
+		{name: "access only", caps: []string{preview.HostCapabilityPortAccess}, want: http.StatusNotFound},
+		{name: "tokens only", caps: []string{preview.HostCapabilityPortTokens}, want: http.StatusNotFound},
+		{name: "browser only", caps: []string{preview.HostCapabilityPortBrowserAuth}, want: http.StatusNotFound},
+		{name: "access and tokens phase3 rollback", caps: []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPortTokens}, want: http.StatusNotFound},
+		{name: "access and browser without tokens", caps: []string{preview.HostCapabilityPortAccess, preview.HostCapabilityPortBrowserAuth}, want: http.StatusNotFound},
+		{name: "tokens and browser without access", caps: []string{preview.HostCapabilityPortTokens, preview.HostCapabilityPortBrowserAuth}, want: http.StatusNotFound},
+		{name: "complete phase4 chain", caps: []string{preview.HostCapabilityPortBrowserAuth, preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess}, want: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/instances/browser", nil)
+			req.Header.Set(preview.ProxyProtocolHeader, preview.HostCapabilityPorts)
+			req.Header.Set(preview.ProxyCapabilitiesHeader, strings.Join(tt.caps, ", "))
+			srv.handleInstance(w, req)
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tt.want, w.Body.String())
+			}
+			if tt.want != http.StatusOK {
+				if got := w.Header().Get(preview.VMDProtocolHeader); got != "" {
+					t.Fatalf("rejected browser lookup attested protocol with %q", got)
+				}
+				return
+			}
+
+			var got instanceResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode browser response: %v", err)
+			}
+			port := strconv.Itoa(int(browserPort))
+			if got.PreviewPortAccess[port] != preview.AccessPrivateBrowserV1 ||
+				got.PreviewPortTokenVersions[port] != 11 {
+				t.Fatalf("browser response = %#v", got)
+			}
+		})
 	}
 }

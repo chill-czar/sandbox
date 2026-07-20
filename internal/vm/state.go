@@ -383,10 +383,10 @@ func (p persistedPreviewPolicy) applyTo(rec *VMRecord) {
 }
 
 // normalizedTokenState makes the token sidecar self-invalidating across a
-// Phase 2 rollback. Phase 2 preserves these fields as unknown JSON while it
-// can legitimately advance Revision with a raw-private snapshot. The stale
-// watermark then differs from Revision, so Phase 3 clears every generation
-// instead of reviving credentials from the older tokenized snapshot.
+// rollback. A writer which predates the active token carrier either clears its
+// generation or advances Revision without a matching watermark. A newer VMD
+// therefore clears every generation instead of reviving credentials from an
+// older tokenized snapshot.
 func (p persistedPreviewPolicy) normalizedTokenState() persistedPreviewPolicy {
 	ports := previewPortsFromRecord(p.Ports, p.PortAccess, p.TokenVersions)
 	ports, watermark := normalizePreviewTokenPolicy(ports, p.Revision, p.TokenPolicyRevision)

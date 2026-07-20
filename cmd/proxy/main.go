@@ -89,6 +89,7 @@ func main() {
 
 		proxyHandler.WithAuth(seed)
 		resolver.WithPreviewTokens()
+		resolver.WithPreviewBrowserAuth()
 		proxyHandler.WithFiles()
 		log.Info().Msg("files endpoint enabled")
 		proxyHandler.WithExec()

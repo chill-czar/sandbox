@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+func TestPreviewTokenCarrierNames(t *testing.T) {
+	if PreviewTokenHeader != "X-Superserve-Preview-Token" ||
+		PreviewTokenQueryParam != "superserve_preview_token" ||
+		PreviewTokenCookie != "__Host-superserve_preview_token" {
+		t.Fatalf("preview carrier names drifted: header=%q query=%q cookie=%q",
+			PreviewTokenHeader, PreviewTokenQueryParam, PreviewTokenCookie)
+	}
+}
+
 var previewTokenTestSeed = []byte("test-seed-key-that-is-at-least-32-bytes-long!!")
 
 const (

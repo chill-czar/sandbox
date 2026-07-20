@@ -34,12 +34,12 @@ func TestRetryUnavailableRetriesUntilSuccess(t *testing.T) {
 	}
 }
 
-func TestPreviewPortsToProtoCarriesTokenVersion(t *testing.T) {
+func TestPreviewPortsToProtoCarriesBrowserAccessAndTokenVersion(t *testing.T) {
 	ports := previewPortsToProto(map[int32]vmdclient.PortPolicy{
-		3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 17},
+		3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 17},
 	})
 	if len(ports) != 1 || ports[0].GetPort() != 3000 ||
-		ports[0].GetAccess() != preview.AccessPrivateTokenV1 || ports[0].GetTokenVersion() != 17 {
+		ports[0].GetAccess() != preview.AccessPrivateBrowserV1 || ports[0].GetTokenVersion() != 17 {
 		t.Fatalf("preview proto = %#v, want port/access/token version", ports)
 	}
 }

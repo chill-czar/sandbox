@@ -110,7 +110,7 @@ func publishedPortPolicies(ports []db.ListPublishedPortsRow) map[int32]vmdclient
 	for _, port := range ports {
 		wireAccess := port.Access
 		if wireAccess == preview.AccessPrivate {
-			wireAccess = preview.AccessPrivateTokenV1
+			wireAccess = preview.AccessPrivateBrowserV1
 		}
 		out[port.Port] = vmdclient.PortPolicy{Access: wireAccess, TokenVersion: port.TokenVersion}
 	}
@@ -127,7 +127,7 @@ func (p previewPolicySnapshot) vmdPorts() map[int32]vmdclient.PortPolicy {
 	}
 	out := make(map[int32]vmdclient.PortPolicy, len(p.Ports))
 	for port, policy := range p.Ports {
-		if policy.Access != preview.AccessPrivateTokenV1 {
+		if !preview.IsTokenizedAccess(policy.Access) {
 			policy.TokenVersion = 0
 		}
 		out[port] = policy
@@ -135,7 +135,7 @@ func (p previewPolicySnapshot) vmdPorts() map[int32]vmdclient.PortPolicy {
 	return out
 }
 
-func (p previewPolicySnapshot) requiresTokenCapability() bool {
+func (p previewPolicySnapshot) requiresBrowserCapability() bool {
 	if p.Access == preview.AccessPrivate {
 		return true
 	}
@@ -144,14 +144,14 @@ func (p previewPolicySnapshot) requiresTokenCapability() bool {
 
 func (p previewPolicySnapshot) hasPrivatePorts() bool {
 	for _, port := range p.Ports {
-		if port.Access == preview.AccessPrivate || port.Access == preview.AccessPrivateTokenV1 {
+		if preview.IsPrivateAccess(port.Access) {
 			return true
 		}
 	}
 	return false
 }
 
-func publicationRequiresTokens(current previewPolicySnapshot, target int32, requestedAccess *string) bool {
+func publicationRequiresBrowserAuth(current previewPolicySnapshot, target int32, requestedAccess *string) bool {
 	targetExists := false
 	for port, policy := range current.Ports {
 		access := policy.Access
@@ -161,7 +161,7 @@ func publicationRequiresTokens(current previewPolicySnapshot, target int32, requ
 				access = *requestedAccess
 			}
 		}
-		if access == preview.AccessPrivate || access == preview.AccessPrivateTokenV1 {
+		if preview.IsPrivateAccess(access) {
 			return true
 		}
 	}
@@ -273,13 +273,22 @@ func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID 
 	return nil
 }
 
+func previewBrowserCapabilities() []string {
+	return []string{
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
+	}
+}
+
+func validateHostPreviewBrowserCapabilities(ctx context.Context, q *db.Queries, hostID string) error {
+	return validateHostPreviewCapabilities(ctx, q, hostID, previewBrowserCapabilities()...)
+}
+
 func validateHostForPreviewSnapshot(ctx context.Context, q *db.Queries, hostID string, policy previewPolicySnapshot) error {
-	if policy.requiresTokenCapability() {
-		return validateHostPreviewCapabilities(ctx, q, hostID,
-			preview.HostCapabilityPorts,
-			preview.HostCapabilityPortAccess,
-			preview.HostCapabilityPortTokens,
-		)
+	if policy.requiresBrowserCapability() {
+		return validateHostPreviewBrowserCapabilities(ctx, q, hostID)
 	}
 	return validateHostPreviewCapabilities(ctx, q, hostID,
 		preview.HostCapabilityPorts,
@@ -349,12 +358,8 @@ func (h *Handlers) requireHostPreviewPortAccess(c *gin.Context, hostID string) b
 	return h.requireHostPreviewCapabilities(c, hostID, preview.HostCapabilityPorts, preview.HostCapabilityPortAccess)
 }
 
-func (h *Handlers) requireHostPreviewPortTokens(c *gin.Context, hostID string) bool {
-	return h.requireHostPreviewCapabilities(c, hostID,
-		preview.HostCapabilityPorts,
-		preview.HostCapabilityPortAccess,
-		preview.HostCapabilityPortTokens,
-	)
+func (h *Handlers) requireHostPreviewPortBrowserAuth(c *gin.Context, hostID string) bool {
+	return h.requireHostPreviewCapabilities(c, hostID, previewBrowserCapabilities()...)
 }
 
 func parsePreviewPort(c *gin.Context) (int32, bool) {
@@ -461,11 +466,11 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "legacy_public routes every port; PATCH preview_access to public or private before publishing a private port", http.StatusConflict)
 		return
 	}
-	preflightNeedsTokens := publicationRequiresTokens(current, body.Port, body.Access)
-	if preflightNeedsTokens && !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
+	preflightNeedsBrowserAuth := publicationRequiresBrowserAuth(current, body.Port, body.Access)
+	if preflightNeedsBrowserAuth && !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
 		return
 	}
-	if !preflightNeedsTokens && !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
+	if !preflightNeedsBrowserAuth && !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
 		return
 	}
 
@@ -480,11 +485,7 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 		return mutationErr
 	}, func(q *db.Queries, result previewPolicySnapshot) error {
 		if result.hasPrivatePorts() {
-			return validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
-				preview.HostCapabilityPorts,
-				preview.HostCapabilityPortAccess,
-				preview.HostCapabilityPortTokens,
-			)
+			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
 		}
 		return validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
 			preview.HostCapabilityPorts,
@@ -497,7 +498,7 @@ func (h *Handlers) PublishSandboxPreviewPort(c *gin.Context) {
 	publishedPolicy, exists := policy.Ports[published.Port]
 	wantWireAccess := published.Access
 	if wantWireAccess == preview.AccessPrivate {
-		wantWireAccess = preview.AccessPrivateTokenV1
+		wantWireAccess = preview.AccessPrivateBrowserV1
 	}
 	if !exists || publishedPolicy.TokenVersion <= 0 || publishedPolicy.Access != wantWireAccess {
 		log.Error().Str("sandbox_id", sandboxID.String()).Int32("port", published.Port).Msg("published port missing a positive authoritative token generation")
@@ -525,6 +526,7 @@ type previewTokenResponse struct {
 	Token         string     `json:"token"`
 	Port          int32      `json:"port"`
 	Header        string     `json:"header"`
+	QueryParam    string     `json:"query_param"`
 	Access        string     `json:"access"`
 	PreviewAccess string     `json:"preview_access"`
 	TokenVersion  int64      `json:"token_version"`
@@ -573,7 +575,7 @@ func buildPreviewTokenResponse(seed []byte, sandboxID uuid.UUID, policy previewP
 		return previewTokenResponse{}, err
 	}
 	return previewTokenResponse{
-		Token: token, Port: port, Header: auth.PreviewTokenHeader,
+		Token: token, Port: port, Header: auth.PreviewTokenHeader, QueryParam: auth.PreviewTokenQueryParam,
 		Access: access, PreviewAccess: policy.Access,
 		TokenVersion: tokenVersion, ExpiresAt: expiresAt,
 	}, nil
@@ -629,10 +631,10 @@ func respondPreviewPortCredentialError(c *gin.Context, err error) bool {
 	return true
 }
 
-// MintSandboxPreviewToken activates header authentication for an existing
-// private Phase 2 publication. The no-op mutation advances the authoritative
+// MintSandboxPreviewToken activates header and browser authentication for an
+// existing private publication. The no-op mutation advances the authoritative
 // revision under the sandbox lock; the credential is returned only after the
-// token-aware snapshot has reached the live host.
+// browser-aware snapshot has reached the live host.
 func (h *Handlers) MintSandboxPreviewToken(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	sandboxID, err := parseSandboxID(c)
@@ -682,7 +684,7 @@ func (h *Handlers) MintSandboxPreviewToken(c *gin.Context) {
 		respondPreviewPortCredentialError(c, errPreviewPortIsPublic)
 		return
 	}
-	if !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
+	if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
 		return
 	}
 
@@ -705,15 +707,11 @@ func (h *Handlers) MintSandboxPreviewToken(c *gin.Context) {
 		})
 		return err
 	}, func(q *db.Queries, result previewPolicySnapshot) (error, error) {
-		if err := validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
-			preview.HostCapabilityPorts,
-			preview.HostCapabilityPortAccess,
-			preview.HostCapabilityPortTokens,
-		); err != nil {
+		if err := validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID); err != nil {
 			return nil, err
 		}
 		pushed, exists := result.Ports[port]
-		if !exists || pushed.TokenVersion != current.TokenVersion || pushed.Access != preview.AccessPrivateTokenV1 {
+		if !exists || pushed.TokenVersion != current.TokenVersion || pushed.Access != preview.AccessPrivateBrowserV1 {
 			return nil, errPreviewTokenSnapshot
 		}
 		credentialSandbox := sandbox
@@ -793,7 +791,7 @@ func (h *Handlers) RotateSandboxPreviewToken(c *gin.Context) {
 		var deliveryErr error
 		pushed, exists := result.Ports[port]
 		switch {
-		case !exists || pushed.TokenVersion != rotated.TokenVersion || pushed.Access != preview.AccessPrivateTokenV1:
+		case !exists || pushed.TokenVersion != rotated.TokenVersion || pushed.Access != preview.AccessPrivateBrowserV1:
 			deliveryOutcome = "snapshot_invalid"
 			deliveryErr = errPreviewTokenSnapshot
 		default:
@@ -804,11 +802,7 @@ func (h *Handlers) RotateSandboxPreviewToken(c *gin.Context) {
 				deliveryErr = errPreviewTokenSeedInvalid
 				break
 			}
-			if capabilityErr := validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
-				preview.HostCapabilityPorts,
-				preview.HostCapabilityPortAccess,
-				preview.HostCapabilityPortTokens,
-			); capabilityErr != nil {
+			if capabilityErr := validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID); capabilityErr != nil {
 				deliveryOutcome = "capability_unavailable"
 				deliveryErr = capabilityErr
 				break

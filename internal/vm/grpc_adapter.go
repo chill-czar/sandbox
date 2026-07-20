@@ -123,7 +123,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
-	if previewPortsContainTokenSentinel(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
+	if previewPortsContainTokenizedAccess(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
 	}
 
@@ -369,7 +369,7 @@ func (a *GRPCAdapter) UpdateSandboxPreviewPolicy(_ context.Context, req *vmdpb.U
 	if err != nil {
 		return nil, err
 	}
-	if previewPortsContainTokenSentinel(ports) && req.GetPolicyRevision() <= 0 {
+	if previewPortsContainTokenizedAccess(ports) && req.GetPolicyRevision() <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive policy_revision")
 	}
 	if err := a.mgr.UpdateSandboxPreviewPolicy(vmID, access, ports, req.GetPolicyRevision()); err != nil {
@@ -393,7 +393,7 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]PreviewPortPolicy
 		}
 		access := item.GetAccess()
 		tokenVersion := item.GetTokenVersion()
-		if access == preview.AccessPrivateTokenV1 {
+		if preview.IsTokenizedAccess(access) {
 			if tokenVersion <= 0 {
 				return nil, status.Errorf(codes.InvalidArgument, "tokenized preview port %d requires a positive token_version", port)
 			}
@@ -407,9 +407,9 @@ func previewPortsFromProto(in []*vmdpb.PreviewPort) (map[int32]PreviewPortPolicy
 	return out, nil
 }
 
-func previewPortsContainTokenSentinel(ports map[int32]PreviewPortPolicy) bool {
+func previewPortsContainTokenizedAccess(ports map[int32]PreviewPortPolicy) bool {
 	for _, policy := range ports {
-		if policy.Access == preview.AccessPrivateTokenV1 {
+		if preview.IsTokenizedAccess(policy.Access) {
 			return true
 		}
 	}

@@ -159,6 +159,7 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 		preview.HostCapabilityPorts,
 		preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
 	} {
 		if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
 			HostID: testDefaultHostID, Capability: capability,
@@ -580,8 +581,11 @@ func TestIntegration_PreviewTokenAPIRequiresWriteAndReturnsExactGeneration(t *te
 		t.Fatalf("mint Cache-Control=%q, want no-store", got)
 	}
 	mintBody := mustJSON(t, minted)
-	if _, ok := mintBody["query_param"]; ok {
-		t.Fatalf("Phase 3 mint response exposed browser carrier: %s", minted.Body.String())
+	if mintBody["query_param"] != auth.PreviewTokenQueryParam {
+		t.Fatalf("mint query_param=%#v, want %q", mintBody["query_param"], auth.PreviewTokenQueryParam)
+	}
+	if _, ok := mintBody["cookie"]; ok {
+		t.Fatalf("mint response exposed cookie value: %s", minted.Body.String())
 	}
 	if mintBody["token_version"] != float64(1) || mintBody["header"] != auth.PreviewTokenHeader {
 		t.Fatalf("mint response=%#v", mintBody)
@@ -595,8 +599,11 @@ func TestIntegration_PreviewTokenAPIRequiresWriteAndReturnsExactGeneration(t *te
 		t.Fatalf("rotate status=%d, want 200; body=%s", rotated.Code, rotated.Body.String())
 	}
 	rotateBody := mustJSON(t, rotated)
-	if rotateBody["token_version"] != float64(2) || !auth.VerifyPreviewToken(seed, sandboxID.String(), 3000, 2, rotateBody["token"].(string)) {
+	if rotateBody["token_version"] != float64(2) || rotateBody["query_param"] != auth.PreviewTokenQueryParam || !auth.VerifyPreviewToken(seed, sandboxID.String(), 3000, 2, rotateBody["token"].(string)) {
 		t.Fatalf("rotate response does not carry valid generation 2 token: %#v", rotateBody)
+	}
+	if _, ok := rotateBody["cookie"]; ok {
+		t.Fatalf("rotate response exposed cookie value: %s", rotated.Body.String())
 	}
 	var version, revision int64
 	if err := testPool.QueryRow(ctx, `
@@ -646,6 +653,29 @@ func seedPrivatePreviewSandbox(t *testing.T, teamID uuid.UUID, hostID, name stri
 		t.Fatalf("insert private preview port: %v", err)
 	}
 	return sandboxID
+}
+
+func seedActivePreviewHost(t *testing.T, capabilities ...string) string {
+	t.Helper()
+	ctx := context.Background()
+	hostID := "preview-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create preview host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("heartbeat preview host: %v", err)
+	}
+	for _, capability := range capabilities {
+		if err := testQueries.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
+			HostID: hostID, Capability: capability,
+		}); err != nil {
+			t.Fatalf("advertise preview host %s: %v", capability, err)
+		}
+	}
+	return hostID
 }
 
 func previewTokenIntegrationRouter(t *testing.T, vmd *stubVMD, seed []byte) *gin.Engine {
@@ -702,27 +732,54 @@ func TestIntegration_MintDeliveryFailureRollsBackRevisionAndReturnsNoCredential(
 	}
 }
 
+func TestIntegration_MintMissingBrowserCapabilityRollsBackRevision(t *testing.T) {
+	teamID, ownerKey := seedTeamAndKey(t)
+	hostID := seedActivePreviewHost(t,
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+	)
+	sandboxID := seedPrivatePreviewSandbox(t, teamID, hostID, "mint-browser-capability-rollback")
+	var vmdCalled bool
+	r := previewTokenIntegrationRouter(t, &stubVMD{updatePreviewFn: func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error {
+		vmdCalled = true
+		return nil
+	}}, []byte("integration-preview-seed-32-bytes!!"))
+
+	path := "/sandboxes/" + sandboxID.String() + "/preview-ports/3000/token"
+	w := do(r, http.MethodPost, path, ownerKey, "")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("mint browser-capability failure status=%d, want 409; body=%s", w.Code, w.Body.String())
+	}
+	if vmdCalled {
+		t.Fatal("browser-incapable mint reached VMD delivery")
+	}
+	if strings.Contains(w.Body.String(), "spv1.") {
+		t.Fatalf("browser-incapable mint leaked a credential: %s", w.Body.String())
+	}
+	if version, revision := readPreviewCredentialState(t, sandboxID); version != 1 || revision != 0 {
+		t.Fatalf("browser-incapable mint state version=%d revision=%d, want 1/0", version, revision)
+	}
+	var mintedActivities int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT count(*) FROM activity WHERE sandbox_id=$1 AND action='preview_token_minted'
+	`, sandboxID).Scan(&mintedActivities); err != nil {
+		t.Fatalf("count browser-incapable mint activities: %v", err)
+	}
+	if mintedActivities != 0 {
+		t.Fatalf("browser-incapable mint wrote %d success activities, want 0", mintedActivities)
+	}
+}
+
 func TestIntegration_RotationFailuresCommitRevocationAndAuditOutcome(t *testing.T) {
 	teamID, ownerKey := seedTeamAndKey(t)
 	validSeed := []byte("integration-preview-seed-32-bytes!!")
 
-	missingCapabilityHost := "rotation-capability-host-" + uuid.New().String()[:8]
-	if _, err := testQueries.CreateHost(context.Background(), db.CreateHostParams{
-		ID: missingCapabilityHost, VmdAddr: "localhost:0", ProxyAddr: "localhost:0", Region: "test",
-		CapacityMemoryMib: 1024, CapacityVcpus: 1,
-	}); err != nil {
-		t.Fatalf("create capability-test host: %v", err)
-	}
-	if _, err := testQueries.UpdateHostHeartbeat(context.Background(), missingCapabilityHost); err != nil {
-		t.Fatalf("heartbeat capability-test host: %v", err)
-	}
-	for _, capability := range []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess} {
-		if err := testQueries.InsertHostCapability(context.Background(), db.InsertHostCapabilityParams{
-			HostID: missingCapabilityHost, Capability: capability,
-		}); err != nil {
-			t.Fatalf("advertise capability-test host %s: %v", capability, err)
-		}
-	}
+	missingCapabilityHost := seedActivePreviewHost(t,
+		preview.HostCapabilityPorts,
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+	)
 
 	tests := []struct {
 		name        string
@@ -804,7 +861,10 @@ func TestIntegration_MintDeliveryHoldsSandboxLockAheadOfRotation(t *testing.T) {
 	defer releaseFirstOnce.Do(func() { close(releaseFirstDelivery) })
 	var pushesMu sync.Mutex
 	var pushedRevisions []int64
-	vmd := &stubVMD{updatePreviewFn: func(callCtx context.Context, _ string, _ string, _ map[int32]vmdclient.PortPolicy, revision int64) error {
+	vmd := &stubVMD{updatePreviewFn: func(callCtx context.Context, _ string, _ string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
+		if got := ports[3000]; got.Access != preview.AccessPrivateBrowserV1 || got.TokenVersion != revision {
+			return fmt.Errorf("revision %d carried non-browser policy %#v", revision, got)
+		}
 		pushesMu.Lock()
 		pushedRevisions = append(pushedRevisions, revision)
 		call := len(pushedRevisions)

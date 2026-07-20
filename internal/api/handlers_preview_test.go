@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -102,7 +103,7 @@ func previewPortPolicyRows(ports ...publishedPortResponse) pgx.Rows {
 	return &scanRows{rows: rows}
 }
 
-func TestPublishedPortPoliciesCarriesGenerationsOnlyForTokenizedPrivatePorts(t *testing.T) {
+func TestPublishedPortPoliciesMapsRawPrivateToBrowserWireMode(t *testing.T) {
 	got := publishedPortPolicies([]db.ListPublishedPortsRow{
 		{Port: 3000, Access: preview.AccessPublic, TokenVersion: 9},
 		{Port: 8080, Access: preview.AccessPrivate, TokenVersion: 12},
@@ -110,8 +111,8 @@ func TestPublishedPortPoliciesCarriesGenerationsOnlyForTokenizedPrivatePorts(t *
 	if got[3000].Access != preview.AccessPublic || got[3000].TokenVersion != 9 {
 		t.Fatalf("control-plane public policy=%#v, want API generation 9", got[3000])
 	}
-	if got[8080].Access != preview.AccessPrivateTokenV1 || got[8080].TokenVersion != 12 {
-		t.Fatalf("private wire policy=%#v, want private_token_v1 generation 12", got[8080])
+	if got[8080].Access != preview.AccessPrivateBrowserV1 || got[8080].TokenVersion != 12 {
+		t.Fatalf("private wire policy=%#v, want private_browser_v1 generation 12", got[8080])
 	}
 	policy := previewPolicySnapshot{Access: preview.AccessPublic, WireAccess: preview.AccessPrivate, Ports: got}
 	wire := policy.vmdPorts()
@@ -123,7 +124,7 @@ func TestPublishedPortPoliciesCarriesGenerationsOnlyForTokenizedPrivatePorts(t *
 	}
 }
 
-func TestPublicationRequiresTokensUsesResultingPerPortModes(t *testing.T) {
+func TestPublicationRequiresBrowserAuthUsesResultingPerPortModes(t *testing.T) {
 	private := preview.AccessPrivate
 	public := preview.AccessPublic
 	tests := []struct {
@@ -135,15 +136,15 @@ func TestPublicationRequiresTokensUsesResultingPerPortModes(t *testing.T) {
 	}{
 		{name: "new omitted inherits private", current: previewPolicySnapshot{Access: preview.AccessPrivate}, port: 3000, want: true},
 		{name: "new explicit public under private default", current: previewPolicySnapshot{Access: preview.AccessPrivate}, port: 3000, access: &public, want: false},
-		{name: "existing private omission preserves private", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateTokenV1}}}, port: 3000, want: true},
-		{name: "explicit public replaces sole private", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateTokenV1}}}, port: 3000, access: &public, want: false},
-		{name: "explicit public leaves private sibling", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateTokenV1}, 8080: {Access: preview.AccessPrivateTokenV1}}}, port: 3000, access: &public, want: true},
+		{name: "existing browser private omission preserves private", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateBrowserV1}}}, port: 3000, want: true},
+		{name: "explicit public replaces sole browser private", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateBrowserV1}}}, port: 3000, access: &public, want: false},
+		{name: "explicit public leaves tokenized private sibling", current: previewPolicySnapshot{Access: preview.AccessPublic, Ports: map[int32]vmdclient.PortPolicy{3000: {Access: preview.AccessPrivateBrowserV1}, 8080: {Access: preview.AccessPrivateTokenV1}}}, port: 3000, access: &public, want: true},
 		{name: "new explicit private", current: previewPolicySnapshot{Access: preview.AccessPublic}, port: 3000, access: &private, want: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := publicationRequiresTokens(tc.current, tc.port, tc.access); got != tc.want {
-				t.Fatalf("publicationRequiresTokens=%v, want %v", got, tc.want)
+			if got := publicationRequiresBrowserAuth(tc.current, tc.port, tc.access); got != tc.want {
+				t.Fatalf("publicationRequiresBrowserAuth=%v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -243,14 +244,16 @@ func TestPatchPreviewAccessPersistsPrivateDefaultAndPreservesPortModes(t *testin
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sandbox := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-new", Name: "preview"}
 	var updatedDefault string
+	var capabilityRequirements [][]string
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sandbox)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 0)
 			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
 				return scalarUUIDRow(sandboxID)
@@ -303,6 +306,14 @@ func TestPatchPreviewAccessPersistsPrivateDefaultAndPreservesPortModes(t *testin
 	if updatedDefault != preview.AccessPrivate || !pushed {
 		t.Fatalf("updated default = %q, pushed=%v", updatedDefault, pushed)
 	}
+	if len(capabilityRequirements) != 2 {
+		t.Fatalf("private PATCH capability checks=%d, want preflight and transaction recheck", len(capabilityRequirements))
+	}
+	for _, got := range capabilityRequirements {
+		if !slices.Equal(got, previewBrowserCapabilities()) {
+			t.Fatalf("private PATCH capabilities=%v, want %v", got, previewBrowserCapabilities())
+		}
+	}
 }
 
 func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing.T) {
@@ -349,6 +360,68 @@ func TestPublishPreviewPortRejectsHostWithoutCapabilityBeforeMutation(t *testing
 	}
 	if mutated || vmdCalled {
 		t.Fatalf("incapable host reached mutation=%v vmd=%v", mutated, vmdCalled)
+	}
+}
+
+func TestPublishPrivatePreviewPathsRequireBrowserCapabilityBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name         string
+		defaultMode  string
+		existingRows []publishedPortResponse
+		body         string
+	}{
+		{name: "explicit private", defaultMode: preview.AccessPublic, body: `{"port":3000,"access":"private"}`},
+		{name: "inferred private default", defaultMode: preview.AccessPrivate, body: `{"port":3000}`},
+		{name: "private sibling", defaultMode: preview.AccessPublic, existingRows: []publishedPortResponse{{Port: 8080, Access: preview.AccessPrivate, TokenVersion: 4}}, body: `{"port":3000,"access":"public"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxID, teamID := uuid.New(), uuid.New()
+			sandbox := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "phase3-host"}
+			var gotCapabilities []string
+			mutated := false
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: GetSandbox :one"):
+						return sandboxRow(sandbox)
+					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+						return previewPolicyRow(tt.defaultMode, 0)
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+						gotCapabilities = append([]string(nil), args[0].([]string)...)
+						return scalarBoolRow(!slices.Contains(gotCapabilities, preview.HostCapabilityPortBrowserAuth))
+					default:
+						mutated = true
+						return errorRow(fmt.Errorf("unexpected mutation QueryRow: %s", sql))
+					}
+				},
+				queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+					if strings.Contains(sql, "-- name: ListPublishedPorts :many") {
+						return previewPortPolicyRows(tt.existingRows...), nil
+					}
+					mutated = true
+					return nil, fmt.Errorf("unexpected mutation Query: %s", sql)
+				},
+				execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+					mutated = true
+					return pgconn.CommandTag{}, fmt.Errorf("unexpected mutation Exec: %s", sql)
+				},
+			}
+			h := &Handlers{DB: db.New(mock), VMD: &stubVMD{}}
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/preview-ports", strings.NewReader(tt.body))
+			setupPreviewRouter(h, teamID.String()).ServeHTTP(w, req)
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status=%d, want 409; body=%s", w.Code, w.Body.String())
+			}
+			if !slices.Equal(gotCapabilities, previewBrowserCapabilities()) {
+				t.Fatalf("private publication capabilities=%v, want %v", gotCapabilities, previewBrowserCapabilities())
+			}
+			if mutated {
+				t.Fatal("browser-incapable host reached private publication mutation")
+			}
+		})
 	}
 }
 
@@ -421,8 +494,8 @@ func TestPublishPreviewPortOmissionPreservesPrivateModeAndPushesRestrictiveSnaps
 			if _, ok := ports[8080]; !ok {
 				t.Errorf("pushed ports = %#v, missing 8080", ports)
 			}
-			if ports[3000].Access != preview.AccessPrivateTokenV1 || ports[8080].Access != preview.AccessPublic {
-				t.Errorf("pushed modes = %#v, want private_token_v1/public", ports)
+			if ports[3000].Access != preview.AccessPrivateBrowserV1 || ports[8080].Access != preview.AccessPublic {
+				t.Errorf("pushed modes = %#v, want private_browser_v1/public", ports)
 			}
 			return nil
 		}},
@@ -603,16 +676,17 @@ type previewCredentialTestEnv struct {
 	h         *Handlers
 	router    *gin.Engine
 
-	published      bool
-	access         string
-	version        int64
-	otherVersion   int64
-	revision       int64
-	revisionBumps  int
-	rotationCalls  int
-	lockedStatus   db.SandboxStatus
-	capabilities   map[string]bool
-	credentialPush func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	published        bool
+	access           string
+	version          int64
+	otherVersion     int64
+	revision         int64
+	revisionBumps    int
+	rotationCalls    int
+	lockedStatus     db.SandboxStatus
+	capabilities     map[string]bool
+	capabilityChecks [][]string
+	credentialPush   func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
 }
 
 func newPreviewCredentialTestEnv(t *testing.T) *previewCredentialTestEnv {
@@ -622,9 +696,10 @@ func newPreviewCredentialTestEnv(t *testing.T) *previewCredentialTestEnv {
 		published: true, access: preview.AccessPrivate, version: 7, otherVersion: 3, revision: 10,
 		lockedStatus: db.SandboxStatusActive,
 		capabilities: map[string]bool{
-			preview.HostCapabilityPorts:      true,
-			preview.HostCapabilityPortAccess: true,
-			preview.HostCapabilityPortTokens: true,
+			preview.HostCapabilityPorts:           true,
+			preview.HostCapabilityPortAccess:      true,
+			preview.HostCapabilityPortTokens:      true,
+			preview.HostCapabilityPortBrowserAuth: true,
 		},
 	}
 	e.sandbox = db.Sandbox{
@@ -656,6 +731,7 @@ func newPreviewCredentialTestEnv(t *testing.T) *previewCredentialTestEnv {
 				return getPortRow()
 			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 				required, _ := args[0].([]string)
+				e.capabilityChecks = append(e.capabilityChecks, append([]string(nil), required...))
 				available := true
 				for _, capability := range required {
 					available = available && e.capabilities[capability]
@@ -742,11 +818,11 @@ func TestMintPreviewTokenActivatesExactHeaderPolicyBeforeReturningCredential(t *
 		if id != e.sandboxID.String() || access != preview.AccessPrivate || revision != 11 {
 			t.Fatalf("push = (%q,%q,%d), want sandbox/raw-private/revision 11", id, access, revision)
 		}
-		if got := ports[3000]; got.Access != preview.AccessPrivateTokenV1 || got.TokenVersion != 7 {
-			t.Fatalf("private port push = %#v, want private_token_v1 v7", got)
+		if got := ports[3000]; got.Access != preview.AccessPrivateBrowserV1 || got.TokenVersion != 7 {
+			t.Fatalf("private port push = %#v, want private_browser_v1 v7", got)
 		}
-		if got := ports[8080]; got.Access != preview.AccessPrivateTokenV1 || got.TokenVersion != 3 {
-			t.Fatalf("sibling private port push = %#v, want private_token_v1 v3", got)
+		if got := ports[8080]; got.Access != preview.AccessPrivateBrowserV1 || got.TokenVersion != 3 {
+			t.Fatalf("sibling private port push = %#v, want private_browser_v1 v3", got)
 		}
 		return nil
 	}
@@ -757,12 +833,23 @@ func TestMintPreviewTokenActivatesExactHeaderPolicyBeforeReturningCredential(t *
 	if !pushed || e.revisionBumps != 1 {
 		t.Fatalf("pushed=%v revision bumps=%d, want activation push after one no-op bump", pushed, e.revisionBumps)
 	}
+	if len(e.capabilityChecks) != 2 {
+		t.Fatalf("mint capability checks=%d, want preflight and transaction recheck", len(e.capabilityChecks))
+	}
+	for _, got := range e.capabilityChecks {
+		if !slices.Equal(got, previewBrowserCapabilities()) {
+			t.Fatalf("mint capabilities=%v, want %v", got, previewBrowserCapabilities())
+		}
+	}
 	if got := w.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
 	body := parseJSON(t, w)
-	if _, exists := body["query_param"]; exists {
-		t.Fatalf("Phase 3 response exposed browser carrier: %s", w.Body.String())
+	if body["query_param"] != auth.PreviewTokenQueryParam {
+		t.Fatalf("query_param = %#v, want %q", body["query_param"], auth.PreviewTokenQueryParam)
+	}
+	if _, exists := body["cookie"]; exists {
+		t.Fatalf("API response exposed cookie value: %s", w.Body.String())
 	}
 	if body["header"] != auth.PreviewTokenHeader || body["access"] != preview.AccessPrivate || body["preview_access"] != preview.AccessPrivate {
 		t.Fatalf("credential metadata = %#v", body)
@@ -896,7 +983,7 @@ func TestMintPreviewTokenMissingSeedAndHostDeliveryFailuresReturnNoCredential(t 
 
 func TestRotatePreviewTokenRevokesOnlyTargetBeforeCapabilityAndDeliveryChecks(t *testing.T) {
 	e := newPreviewCredentialTestEnv(t)
-	e.capabilities[preview.HostCapabilityPortTokens] = false
+	e.capabilities[preview.HostCapabilityPortBrowserAuth] = false
 	w := e.request(http.MethodPost, "/token/rotate", "")
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status=%d want 409 after revocation; body=%s", w.Code, w.Body.String())
@@ -914,7 +1001,9 @@ func TestRotatePreviewTokenPushesNewExactGenerationThenReturnsHeaderToken(t *tes
 	var pushed bool
 	e.credentialPush = func(_ context.Context, _ string, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error {
 		pushed = true
-		if access != preview.AccessPrivate || revision != 11 || ports[3000].TokenVersion != 8 || ports[8080].TokenVersion != 3 {
+		if access != preview.AccessPrivate || revision != 11 ||
+			ports[3000].Access != preview.AccessPrivateBrowserV1 || ports[3000].TokenVersion != 8 ||
+			ports[8080].Access != preview.AccessPrivateBrowserV1 || ports[8080].TokenVersion != 3 {
 			t.Fatalf("rotation push access=%q revision=%d ports=%#v", access, revision, ports)
 		}
 		return nil
@@ -924,8 +1013,11 @@ func TestRotatePreviewTokenPushesNewExactGenerationThenReturnsHeaderToken(t *tes
 		t.Fatalf("status=%d pushed=%v body=%s", w.Code, pushed, w.Body.String())
 	}
 	body := parseJSON(t, w)
-	if body["token_version"] != float64(8) || body["header"] != auth.PreviewTokenHeader {
+	if body["token_version"] != float64(8) || body["header"] != auth.PreviewTokenHeader || body["query_param"] != auth.PreviewTokenQueryParam {
 		t.Fatalf("response=%#v", body)
+	}
+	if _, exists := body["cookie"]; exists {
+		t.Fatalf("rotation response exposed cookie value: %#v", body)
 	}
 	if !auth.VerifyPreviewToken(previewHeaderTokenTestSeed, e.sandboxID.String(), 3000, 8, body["token"].(string)) {
 		t.Fatal("replacement token does not verify at the new generation")
