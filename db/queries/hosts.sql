@@ -48,6 +48,7 @@ SELECT EXISTS(
   FROM host_capability hc
   JOIN host h ON h.id = hc.host_id
   WHERE hc.host_id = $1 AND hc.capability = $2
+    AND h.status = 'active'
     AND hc.heartbeat_at = h.last_heartbeat_at
 );
 

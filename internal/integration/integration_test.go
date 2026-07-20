@@ -171,6 +171,46 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	return nil
 }
 
+func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
+	ctx := context.Background()
+	hostID := "capability-host-" + uuid.New().String()[:8]
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID:                hostID,
+		VmdAddr:           "localhost:0",
+		ProxyAddr:         "localhost:0",
+		Region:            "test",
+		CapacityMemoryMib: 1024,
+		CapacityVcpus:     1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	if _, err := testQueries.UpdateHostHeartbeat(ctx, hostID); err != nil {
+		t.Fatalf("heartbeat host: %v", err)
+	}
+	params := db.InsertHostCapabilityParams{HostID: hostID, Capability: preview.HostCapabilityPorts}
+	if err := testQueries.InsertHostCapability(ctx, params); err != nil {
+		t.Fatalf("advertise capability: %v", err)
+	}
+	hasCapability := func() bool {
+		got, err := testQueries.HostHasCapability(ctx, db.HostHasCapabilityParams{
+			HostID: hostID, Capability: preview.HostCapabilityPorts,
+		})
+		if err != nil {
+			t.Fatalf("check capability: %v", err)
+		}
+		return got
+	}
+	if !hasCapability() {
+		t.Fatal("current capability on active host was not recognized")
+	}
+	if err := testQueries.MarkHostUnhealthy(ctx, hostID); err != nil {
+		t.Fatalf("mark host unhealthy: %v", err)
+	}
+	if hasCapability() {
+		t.Fatal("unhealthy host retained a usable capability attestation")
+	}
+}
+
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
 // in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
 // safe to run repeatedly against the same database.

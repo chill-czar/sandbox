@@ -57,4 +57,7 @@ func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 	if got := strings.Count(queries, "hc.heartbeat_at = h.last_heartbeat_at"); got < 2 {
 		t.Fatalf("current-heartbeat attestation checks = %d, want both host gate and scheduler", got)
 	}
+	if !strings.Contains(queries, "h.status = 'active'") {
+		t.Fatal("host capability gate accepts capabilities from an unhealthy host")
+	}
 }
