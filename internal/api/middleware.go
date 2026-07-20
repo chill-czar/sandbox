@@ -4,13 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -45,10 +46,13 @@ func apiKeyHasScope(c *gin.Context, scope string) bool {
 func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 	cache := newAPIKeyCache(apiKeyCacheTTLFromEnv())
 	touchLastUsed := func(ctx context.Context, id string) {
-		// Fire and forget. The context is extracted by the caller before
-		// spawning so the goroutine does not capture c — gin recycles
-		// *Context back to the pool after ServeHTTP returns, causing a
-		// data race if the goroutine reads c.Request later.
+		// Fire and forget: detach here, not at call sites — the caller's ctx
+		// may be cancelled the moment it returns (request teardown, or fetch's
+		// deferred cancel on the flight ctx), which would kill the update
+		// before it runs. The ctx is extracted by the caller before spawning
+		// so the goroutine does not capture c — gin recycles *Context back to
+		// the pool after ServeHTTP returns.
+		ctx = context.WithoutCancel(ctx)
 		go func() {
 			_, _ = pool.Exec(ctx,
 				"UPDATE api_key SET last_used_at = now() WHERE id = $1", id)
@@ -68,57 +72,88 @@ func APIKeyAuth(pool *pgxpool.Pool) gin.HandlerFunc {
 
 		if entry, needTouch, ok := cache.get(keyHash, time.Now()); ok {
 			if needTouch {
-				touchLastUsed(context.WithoutCancel(c.Request.Context()), entry.id)
+				touchLastUsed(c.Request.Context(), entry.id)
 			}
-			c.Set("api_key_id", entry.id)
-			c.Set("api_key_name", entry.name)
-			c.Set("api_key_scopes", entry.scopes)
-			c.Set("team_id", entry.teamID)
-			if entry.createdBy.Valid && !isConsoleImpersonation(c) {
-				c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
-			}
+			setAPIKeyContext(c, entry)
 			c.Set("auth_ms", time.Since(authStart).Milliseconds())
 			c.Next()
 			return
 		}
 
-		var id, teamID, name string
-		var scopes []string
-		var createdBy pgtype.UUID
-		var expiresAt pgtype.Timestamptz
-		err := pool.QueryRow(c.Request.Context(),
-			"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
-			keyHash,
-		).Scan(&id, &teamID, &name, &scopes, &createdBy, &expiresAt)
+		// Miss: fetch coalesces concurrent identical lookups, so a burst
+		// arriving on an expired entry runs one query, not one per request.
+		// The touch and put happen inside fn so only the executing caller
+		// performs them — waiters share the entry without re-touching.
+		entry, err := cache.fetch(c.Request.Context(), keyHash, func(qctx context.Context) (apiKeyCacheEntry, error) {
+			var e apiKeyCacheEntry
+			err := pool.QueryRow(qctx,
+				"SELECT id, team_id, name, scopes, created_by, expires_at FROM api_key WHERE key_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+				keyHash,
+			).Scan(&e.id, &e.teamID, &e.name, &e.scopes, &e.createdBy, &e.expiresAt)
+			if err != nil {
+				return apiKeyCacheEntry{}, err
+			}
+			if cache.put(keyHash, e, time.Now()) {
+				touchLastUsed(qctx, e.id)
+			}
+			return e, nil
+		})
 		if err != nil {
-			// Lookup failed — usually a bad key, but with per-cell databases
-			// it is also how a valid key presented to the wrong cell fails.
-			// respondAuthFailed names the right region when the key says so.
+			switch {
+			case c.Request.Context().Err() != nil:
+				// Caller gone or its deadline fired; abort without an Error
+				// log. Keyed on the request context, not the error value: the
+				// shared flight's own timeout also surfaces DeadlineExceeded
+				// and must fall through to the cases below.
+				respondErrorMsg(c, "service_unavailable",
+					"Authentication is temporarily unavailable. Please retry.",
+					http.StatusServiceUnavailable)
+			case errors.Is(err, pgx.ErrNoRows):
+				// The real bad-key case — with per-cell databases it is also
+				// how a valid key presented to the wrong cell fails;
+				// respondAuthFailed names the right region when the key says so.
+				respondAuthFailed(c, apiKey)
+			case respondWrongRegion(c, apiKey):
+				// A key tagged for another cell can never authenticate here,
+				// whatever the lookup said — the redirect hint already went out.
+			default:
+				// Infrastructure failure, shared by every coalesced waiter —
+				// a 401 here would read as mass key invalidation to SDKs.
+				// 503 is honest and retryable.
+				log.Error().Err(err).Msg("API key lookup failed")
+				respondErrorMsg(c, "service_unavailable",
+					"Authentication is temporarily unavailable. Please retry.",
+					http.StatusServiceUnavailable)
+			}
+			c.Abort()
+			return
+		}
+
+		// A shared flight's result was evaluated at the executing caller's
+		// time; re-check key expiry at THIS request's time, exactly like the
+		// cache-hit path does on every get.
+		if entry.expiresAt.Valid && !time.Now().Before(entry.expiresAt.Time) {
 			respondAuthFailed(c, apiKey)
 			c.Abort()
 			return
 		}
 
-		if cache.put(keyHash, apiKeyCacheEntry{
-			id:        id,
-			teamID:    teamID,
-			name:      name,
-			scopes:    scopes,
-			createdBy: createdBy,
-			expiresAt: expiresAt,
-		}, time.Now()) {
-			touchLastUsed(context.WithoutCancel(c.Request.Context()), id)
-		}
-
-		c.Set("api_key_id", id)
-		c.Set("api_key_name", name)
-		c.Set("api_key_scopes", scopes)
-		c.Set("team_id", teamID)
-		if createdBy.Valid && !isConsoleImpersonation(c) {
-			c.Set("actor_id", uuid.UUID(createdBy.Bytes))
-		}
+		setAPIKeyContext(c, entry)
 		c.Set("auth_ms", time.Since(authStart).Milliseconds())
 		c.Next()
+	}
+}
+
+// setAPIKeyContext copies an authenticated key's identity into the request
+// context, shared by the cache-hit and lookup paths. The impersonation check
+// reads entry.name directly (not the gin key) so it cannot depend on Set order.
+func setAPIKeyContext(c *gin.Context, entry apiKeyCacheEntry) {
+	c.Set("api_key_id", entry.id)
+	c.Set("api_key_name", entry.name)
+	c.Set("api_key_scopes", entry.scopes)
+	c.Set("team_id", entry.teamID)
+	if entry.createdBy.Valid && entry.name != consoleImpersonationKeyName {
+		c.Set("actor_id", uuid.UUID(entry.createdBy.Bytes))
 	}
 }
 

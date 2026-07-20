@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,5 +179,91 @@ func TestAPIKeyCacheTTLFromEnv(t *testing.T) {
 	t.Setenv("API_KEY_CACHE_TTL", "garbage")
 	if got := apiKeyCacheTTLFromEnv(); got != defaultAPIKeyCacheTTL {
 		t.Errorf("garbage: expected default, got %v", got)
+	}
+}
+
+func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	var calls atomic.Int64
+	release := make(chan struct{})
+
+	// Every flight blocks on release, and release closes only after all 50
+	// goroutines have signaled ready immediately before calling fetch — so
+	// nearly all of them are parked inside the first flight when it completes.
+	// Only a goroutine preempted in the instructions between ready.Done and
+	// group.Do can run its own (instant) flight afterward; a small tolerance
+	// absorbs those without any wall-clock dependence.
+	var wg, ready sync.WaitGroup
+	launch := func() {
+		defer wg.Done()
+		ready.Done()
+		entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
+			calls.Add(1)
+			<-release
+			return apiKeyCacheEntry{id: "id1"}, nil
+		})
+		if err != nil || entry.id != "id1" {
+			t.Errorf("fetch: entry=%+v err=%v", entry, err)
+		}
+	}
+
+	wg.Add(50)
+	ready.Add(50)
+	for i := 0; i < 50; i++ {
+		go launch()
+	}
+	ready.Wait()
+	time.Sleep(2 * time.Millisecond) // let the signaled goroutines cross into group.Do
+	close(release)
+	wg.Wait()
+
+	if n := calls.Load(); n > 5 {
+		t.Errorf("expected coalesced lookups (<=5), got %d", n)
+	}
+}
+
+// fetch's context contract: the coalescing branch detaches from the caller
+// (waiters may outlive the triggering request), the disabled branch must NOT
+// (a client disconnect has to cancel the lookup).
+func TestAPIKeyCache_FetchContextContract(t *testing.T) {
+	// The shared flight runs detached from the caller: no cancellation, own
+	// deadline. Exercised with a LIVE caller ctx so fn actually runs.
+	c := newAPIKeyCache(10 * time.Second)
+	if _, err := c.fetch(context.Background(), "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() != nil {
+			t.Errorf("shared flight must be detached from the caller, got %v", qctx.Err())
+		}
+		if _, ok := qctx.Deadline(); !ok {
+			t.Error("shared flight must carry its own deadline")
+		}
+		return apiKeyCacheEntry{id: "id1"}, nil
+	}); err != nil {
+		t.Errorf("fetch: %v", err)
+	}
+
+	// A waiter whose own context is done returns immediately rather than
+	// blocking on the flight. fn is gated open so the only way fetch can
+	// return is via the caller's cancellation.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	gate := make(chan struct{})
+	if _, err := c.fetch(cancelled, "hash2", func(context.Context) (apiKeyCacheEntry, error) {
+		<-gate // never released
+		return apiKeyCacheEntry{}, nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled caller must return context.Canceled, got %v", err)
+	}
+	close(gate)
+
+	// Disabled cache (nil) runs fn directly under the caller's context, so a
+	// client disconnect cancels the lookup.
+	var disabled *apiKeyCache
+	if _, err := disabled.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() == nil {
+			t.Error("disabled cache must run under the caller's context (cancellation invisible)")
+		}
+		return apiKeyCacheEntry{id: "id2"}, nil
+	}); err != nil {
+		t.Errorf("nil-cache fetch: %v", err)
 	}
 }
