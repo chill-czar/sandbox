@@ -52,6 +52,8 @@ func (s *stubScheduler) SelectHost(_ context.Context, required []string) (string
 	return s.hostID, s.err
 }
 
+func (s *stubScheduler) Invalidate() {}
+
 func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) error {
 	if s.destroyFn != nil {
 		return s.destroyFn(ctx, id, force)
