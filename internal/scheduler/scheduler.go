@@ -7,7 +7,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -36,8 +39,10 @@ type LeastLoaded struct {
 	DefaultHostID string        // fallback when no host rows exist
 	TTL           time.Duration // 0 = use defaultCacheTTL
 
-	mu    sync.RWMutex
-	cache map[string]hostCacheEntry
+	mu         sync.RWMutex
+	cache      map[string]hostCacheEntry
+	gen        uint64      // bumped by Invalidate and blocking reloads; discards refreshes that started earlier
+	refreshing atomic.Bool // one background refresh at a time across capability sets
 }
 
 type hostCacheEntry struct {
@@ -82,25 +87,70 @@ func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []str
 	return hosts[b].ID, nil
 }
 
+// hostsStaleGrace bounds how long an expired candidate set keeps being served
+// while refreshes run (or fail) in the background. Host health flows through
+// the DB, and every capability set is keyed independently, so persistent
+// refresh failures degrade to blocking loads instead of serving stale hosts
+// forever.
+const hostsStaleGrace = 30 * time.Second
+
+// loadHosts serves a cached capability-specific candidate set — stale
+// included, up to hostsStaleGrace — and refreshes it in the background once
+// the TTL lapses. The first call for a set, a post-Invalidate call, and any
+// call past the grace window block on a fresh load.
 func (s *LeastLoaded) loadHosts(ctx context.Context, requiredCapabilities []string) ([]db.ListActiveHostsByLoadRow, error) {
 	key, normalized := capabilityCacheKey(requiredCapabilities)
 	s.mu.RLock()
-	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl() {
-		s.mu.RUnlock()
+	entry, cached := s.cache[key]
+	startGen := s.gen
+	s.mu.RUnlock()
+
+	if cached && time.Since(entry.cachedAt) >= s.ttl()+hostsStaleGrace {
+		cached = false
+	}
+	if cached {
+		if time.Since(entry.cachedAt) >= s.ttl() && s.refreshing.CompareAndSwap(false, true) {
+			// Detached: the refresh outlives the triggering request. On error the
+			// stale set stays servable and the next expired call retries.
+			qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			go func() {
+				defer cancel()
+				defer s.refreshing.Store(false)
+				hosts, err := s.DB.ListActiveHostsByLoad(qctx, normalized)
+				if err != nil {
+					log.Warn().Err(err).Strs("required_capabilities", normalized).
+						Msg("host list refresh failed; serving stale until the grace window expires")
+					return
+				}
+				s.mu.Lock()
+				// Discard results from before the latest Invalidate or blocking
+				// reload so an older query cannot replace a newer candidate set.
+				if s.gen == startGen {
+					if s.cache == nil {
+						s.cache = make(map[string]hostCacheEntry)
+					}
+					s.cache[key] = hostCacheEntry{hosts: hosts, cachedAt: time.Now()}
+				}
+				s.mu.Unlock()
+			}()
+		}
 		return entry.hosts, nil
 	}
-	s.mu.RUnlock()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl() {
+	// Double-check: another blocked caller may have reloaded this capability
+	// set while we waited. A past-grace entry is what we are here to replace.
+	if entry, ok := s.cache[key]; ok && time.Since(entry.cachedAt) < s.ttl()+hostsStaleGrace {
 		return entry.hosts, nil
 	}
-
 	hosts, err := s.DB.ListActiveHostsByLoad(ctx, normalized)
 	if err != nil {
 		return nil, fmt.Errorf("list active hosts by load: %w", err)
 	}
+	// Bump the generation so any older in-flight background refresh cannot
+	// land after this blocking load and replace it with an earlier snapshot.
+	s.gen++
 	if s.cache == nil {
 		s.cache = make(map[string]hostCacheEntry)
 	}
@@ -123,10 +173,11 @@ func capabilityCacheKey(capabilities []string) (string, []string) {
 	return strings.Join(normalized, "\x00"), normalized
 }
 
-// Invalidate drops the cached host list so the next SelectHost reflects
-// changes immediately.
+// Invalidate drops all cached capability-specific candidate sets so the next
+// SelectHost reflects status or capability changes immediately.
 func (s *LeastLoaded) Invalidate() {
 	s.mu.Lock()
+	s.gen++
 	s.cache = nil
 	s.mu.Unlock()
 }

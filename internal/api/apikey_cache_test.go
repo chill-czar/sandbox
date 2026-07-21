@@ -1,7 +1,11 @@
 package api
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,7 +17,7 @@ func TestAPIKeyCache_HitReturnsEntry(t *testing.T) {
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1", teamID: "team1"}, now)
 
-	entry, needTouch, ok := c.get("hash1", now.Add(time.Second))
+	entry, needTouch, _, ok := c.get("hash1", now.Add(time.Second))
 	if !ok {
 		t.Fatal("expected cache hit")
 	}
@@ -26,16 +30,36 @@ func TestAPIKeyCache_HitReturnsEntry(t *testing.T) {
 	}
 }
 
-func TestAPIKeyCache_MissAfterTTL(t *testing.T) {
+func TestAPIKeyCache_StaleServeThenMiss(t *testing.T) {
 	c := newAPIKeyCache(30 * time.Second)
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1", teamID: "team1"}, now)
 
-	if _, _, ok := c.get("hash1", now.Add(31*time.Second)); ok {
-		t.Error("expected miss after TTL")
+	// Inside the grace window past the TTL: served, and this caller is told
+	// to kick the refresh.
+	entry, _, refresh, ok := c.get("hash1", now.Add(31*time.Second))
+	if !ok || !refresh || entry.id != "id1" {
+		t.Fatalf("expected stale serve inside grace, got ok=%v refresh=%v", ok, refresh)
 	}
-	// The expired entry is retained (never served) so put can carry its
-	// lastTouch across the refill; the capacity sweep reclaims it eventually.
+	// The trigger is armed: further stale hits serve but must not re-kick.
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || refresh {
+		t.Errorf("second stale hit must not arm another refresh, got ok=%v refresh=%v", ok, refresh)
+	}
+	// A transient refresh failure re-arms the trigger.
+	c.refreshFailed("hash1")
+	if _, _, refresh, ok := c.get("hash1", now.Add(31*time.Second)); !ok || !refresh {
+		t.Errorf("refreshFailed must re-arm the trigger, got ok=%v refresh=%v", ok, refresh)
+	}
+	// Fresh entries are not flagged.
+	if _, _, refresh, ok := c.get("hash1", now.Add(time.Second)); !ok || refresh {
+		t.Errorf("fresh entry must not trigger a refresh, got ok=%v refresh=%v", ok, refresh)
+	}
+	// Past ttl+grace: a real miss.
+	if _, _, _, ok := c.get("hash1", now.Add(30*time.Second+apiKeyCacheStaleGrace+time.Second)); ok {
+		t.Error("expected miss past the grace window")
+	}
+	// The entry is retained through the miss so put can carry its lastTouch
+	// across the refill; the capacity sweep reclaims it eventually.
 	c.mu.Lock()
 	_, exists := c.m["hash1"]
 	c.mu.Unlock()
@@ -63,7 +87,7 @@ func TestAPIKeyCache_TouchThrottleSurvivesRefill(t *testing.T) {
 
 func TestAPIKeyCache_MissUnknownKey(t *testing.T) {
 	c := newAPIKeyCache(30 * time.Second)
-	if _, _, ok := c.get("nope", time.Now()); ok {
+	if _, _, _, ok := c.get("nope", time.Now()); ok {
 		t.Error("expected miss for unknown key")
 	}
 }
@@ -78,11 +102,11 @@ func TestAPIKeyCache_KeyExpiryCheckedOnHit(t *testing.T) {
 	}, now)
 
 	// Inside TTL and before expires_at: hit.
-	if _, _, ok := c.get("hash1", now.Add(5*time.Second)); !ok {
+	if _, _, _, ok := c.get("hash1", now.Add(5*time.Second)); !ok {
 		t.Error("expected hit before expires_at")
 	}
 	// Inside TTL but past expires_at: miss, even though TTL hasn't lapsed.
-	if _, _, ok := c.get("hash1", now.Add(11*time.Second)); ok {
+	if _, _, _, ok := c.get("hash1", now.Add(11*time.Second)); ok {
 		t.Error("expected miss after expires_at despite fresh TTL")
 	}
 }
@@ -92,14 +116,14 @@ func TestAPIKeyCache_TouchThrottle(t *testing.T) {
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now)
 
-	if _, needTouch, _ := c.get("hash1", now.Add(30*time.Second)); needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(30*time.Second)); needTouch {
 		t.Error("expected no touch before interval elapses")
 	}
-	if _, needTouch, _ := c.get("hash1", now.Add(lastUsedTouchInterval)); !needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(lastUsedTouchInterval)); !needTouch {
 		t.Error("expected touch once interval elapsed")
 	}
 	// The touch above reset the clock; immediately after, no touch again.
-	if _, needTouch, _ := c.get("hash1", now.Add(lastUsedTouchInterval+time.Second)); needTouch {
+	if _, needTouch, _, _ := c.get("hash1", now.Add(lastUsedTouchInterval+time.Second)); needTouch {
 		t.Error("expected no touch right after a touch")
 	}
 }
@@ -111,7 +135,7 @@ func TestAPIKeyCache_DisabledNilSafe(t *testing.T) {
 	}
 	now := time.Now()
 	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now) // must not panic
-	if _, _, ok := c.get("hash1", now); ok {
+	if _, _, _, ok := c.get("hash1", now); ok {
 		t.Error("disabled cache must always miss")
 	}
 }
@@ -127,7 +151,7 @@ func TestAPIKeyCache_SweepAtCapacity(t *testing.T) {
 	later := now.Add(31 * time.Second)
 	c.put("fresh", apiKeyCacheEntry{id: "fresh"}, later)
 
-	if _, _, ok := c.get("fresh", later); !ok {
+	if _, _, _, ok := c.get("fresh", later); !ok {
 		t.Error("expected fresh entry after sweep")
 	}
 	c.mu.Lock()
@@ -148,7 +172,7 @@ func TestAPIKeyCache_ResetWhenFullOfFreshEntries(t *testing.T) {
 	// exceed the cap and the new entry must be present.
 	c.put("fresh", apiKeyCacheEntry{id: "fresh"}, now.Add(time.Second))
 
-	if _, _, ok := c.get("fresh", now.Add(2*time.Second)); !ok {
+	if _, _, _, ok := c.get("fresh", now.Add(2*time.Second)); !ok {
 		t.Error("expected fresh entry after reset")
 	}
 	c.mu.Lock()
@@ -176,4 +200,102 @@ func TestAPIKeyCacheTTLFromEnv(t *testing.T) {
 	if got := apiKeyCacheTTLFromEnv(); got != defaultAPIKeyCacheTTL {
 		t.Errorf("garbage: expected default, got %v", got)
 	}
+}
+
+func TestAPIKeyCache_FetchCoalescesConcurrentMisses(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	var calls atomic.Int64
+	release := make(chan struct{})
+
+	// Every flight blocks on release, and release closes only after all 50
+	// goroutines have signaled ready immediately before calling fetch — so
+	// nearly all of them are parked inside the first flight when it completes.
+	// Only a goroutine preempted in the instructions between ready.Done and
+	// group.Do can run its own (instant) flight afterward; a small tolerance
+	// absorbs those without any wall-clock dependence.
+	var wg, ready sync.WaitGroup
+	launch := func() {
+		defer wg.Done()
+		ready.Done()
+		entry, err := c.fetch(context.Background(), "hash1", func(context.Context) (apiKeyCacheEntry, error) {
+			calls.Add(1)
+			<-release
+			return apiKeyCacheEntry{id: "id1"}, nil
+		})
+		if err != nil || entry.id != "id1" {
+			t.Errorf("fetch: entry=%+v err=%v", entry, err)
+		}
+	}
+
+	wg.Add(50)
+	ready.Add(50)
+	for i := 0; i < 50; i++ {
+		go launch()
+	}
+	ready.Wait()
+	time.Sleep(2 * time.Millisecond) // let the signaled goroutines cross into group.Do
+	close(release)
+	wg.Wait()
+
+	if n := calls.Load(); n > 5 {
+		t.Errorf("expected coalesced lookups (<=5), got %d", n)
+	}
+}
+
+// fetch's context contract: the coalescing branch detaches from the caller
+// (waiters may outlive the triggering request), the disabled branch must NOT
+// (a client disconnect has to cancel the lookup).
+func TestAPIKeyCache_FetchContextContract(t *testing.T) {
+	// The shared flight runs detached from the caller: no cancellation, own
+	// deadline. Exercised with a LIVE caller ctx so fn actually runs.
+	c := newAPIKeyCache(10 * time.Second)
+	if _, err := c.fetch(context.Background(), "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() != nil {
+			t.Errorf("shared flight must be detached from the caller, got %v", qctx.Err())
+		}
+		if _, ok := qctx.Deadline(); !ok {
+			t.Error("shared flight must carry its own deadline")
+		}
+		return apiKeyCacheEntry{id: "id1"}, nil
+	}); err != nil {
+		t.Errorf("fetch: %v", err)
+	}
+
+	// A waiter whose own context is done returns immediately rather than
+	// blocking on the flight. fn is gated open so the only way fetch can
+	// return is via the caller's cancellation.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	gate := make(chan struct{})
+	if _, err := c.fetch(cancelled, "hash2", func(context.Context) (apiKeyCacheEntry, error) {
+		<-gate // never released
+		return apiKeyCacheEntry{}, nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled caller must return context.Canceled, got %v", err)
+	}
+	close(gate)
+
+	// Disabled cache (nil) runs fn directly under the caller's context, so a
+	// client disconnect cancels the lookup.
+	var disabled *apiKeyCache
+	if _, err := disabled.fetch(cancelled, "hash1", func(qctx context.Context) (apiKeyCacheEntry, error) {
+		if qctx.Err() == nil {
+			t.Error("disabled cache must run under the caller's context (cancellation invisible)")
+		}
+		return apiKeyCacheEntry{id: "id2"}, nil
+	}); err != nil {
+		t.Errorf("nil-cache fetch: %v", err)
+	}
+}
+
+func TestAPIKeyCache_RemoveDropsEntry(t *testing.T) {
+	c := newAPIKeyCache(10 * time.Second)
+	now := time.Now()
+	c.put("hash1", apiKeyCacheEntry{id: "id1"}, now)
+	c.remove("hash1")
+	if _, _, _, ok := c.get("hash1", now); ok {
+		t.Fatal("removed entry must not be served")
+	}
+	var disabled *apiKeyCache
+	disabled.remove("hash1") // nil-safe, must not panic
 }
