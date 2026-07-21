@@ -52,27 +52,27 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	replace := func(q *db.Queries) (db.Host, error) {
+	replace := func(q *db.Queries) (db.UpdateHostHeartbeatRow, error) {
 		host, err := q.UpdateHostHeartbeat(ctx, hostID)
 		if err != nil {
-			return db.Host{}, err
+			return db.UpdateHostHeartbeatRow{}, err
 		}
 		// Missing capabilities is an explicit empty replacement. This clears a
 		// stale attestation immediately when VMD can no longer verify its proxy.
 		if err := q.DeleteHostCapabilities(ctx, hostID); err != nil {
-			return db.Host{}, err
+			return db.UpdateHostHeartbeatRow{}, err
 		}
 		for _, capability := range capabilities {
 			if err := q.InsertHostCapability(ctx, db.InsertHostCapabilityParams{
 				HostID: hostID, Capability: capability,
 			}); err != nil {
-				return db.Host{}, err
+				return db.UpdateHostHeartbeatRow{}, err
 			}
 		}
 		return host, nil
 	}
 
-	var host db.Host
+	var host db.UpdateHostHeartbeatRow
 	var err error
 	if h.Pool == nil {
 		host, err = replace(h.DB)
@@ -93,6 +93,15 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		log.Error().Err(err).Str("host_id", hostID).Msg("UpdateHostHeartbeat failed")
 		respondError(c, ErrInternal)
 		return
+	}
+
+	if host.PrevStatus == "unhealthy" && host.Status == "active" {
+		// The heartbeat just recovered this host; drop the scheduler's cached
+		// list so its capacity is usable now, not after the cache TTL.
+		log.Info().Str("host_id", hostID).Msg("host recovered via heartbeat")
+		if h.Scheduler != nil {
+			h.Scheduler.Invalidate()
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": host.Status})
