@@ -48,7 +48,7 @@ func TestMissingPreviewPolicyRowRemainsLegacyPublic(t *testing.T) {
 }
 
 func TestPreviewAccessMigrationKeepsRollbackStateInSideTables(t *testing.T) {
-	path := filepath.Join("..", "..", "supabase", "migrations", "20260721000002_preview_port_access_policy.sql")
+	path := filepath.Join("..", "..", "supabase", "migrations", "20260727000002_preview_port_access_policy.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
