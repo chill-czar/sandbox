@@ -39,6 +39,12 @@ resource "google_compute_subnetwork" "primary" {
   region        = var.region
   ip_cidr_range = var.subnet_cidr
   network       = local.network_self_link
+
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.5
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
 }
 
 resource "google_compute_subnetwork" "connector" {
@@ -49,6 +55,12 @@ resource "google_compute_subnetwork" "connector" {
   region        = var.region
   ip_cidr_range = var.vpc_connector_subnet_ip
   network       = local.network_self_link
+
+  log_config {
+    aggregation_interval = "INTERVAL_10_MIN"
+    flow_sampling        = 0.5
+    metadata             = "INCLUDE_ALL_METADATA"
+  }
 }
 
 resource "google_vpc_access_connector" "this" {
@@ -114,6 +126,71 @@ resource "google_compute_firewall" "rules" {
 }
 
 locals {
+  # GCP firewall names are limited to 63 characters; network and region names
+  # can consume that budget, so long names are shortened and retain a hash to
+  # avoid collisions between distinct full names.
+  ssh_deny_name_base = "${var.network_name}-${var.region}-deny-unrestricted-ssh"
+  ssh_deny_name_hash = substr(md5(local.ssh_deny_name_base), 0, 8)
+  ssh_deny_ipv4_name = length(local.ssh_deny_name_base) <= 63 ? local.ssh_deny_name_base : "${substr(local.ssh_deny_name_base, 0, 54)}-${local.ssh_deny_name_hash}"
+  ssh_deny_ipv6_name = length(local.ssh_deny_name_base) <= 60 ? "${local.ssh_deny_name_base}-v6" : "${substr(local.ssh_deny_name_base, 0, 51)}-v6-${local.ssh_deny_name_hash}"
+
+  iap_ssh_name_base = "${var.network_name}-${var.region}-allow-iap-ssh"
+  iap_ssh_name_hash = substr(md5(local.iap_ssh_name_base), 0, 8)
+  iap_ssh_name      = length(local.iap_ssh_name_base) <= 63 ? local.iap_ssh_name_base : "${substr(local.iap_ssh_name_base, 0, 54)}-${local.iap_ssh_name_hash}"
+}
+
+resource "google_compute_firewall" "deny_unrestricted_ssh" {
+  for_each = var.manage_public_ssh_deny ? {
+    ipv4 = ["0.0.0.0/0"]
+    ipv6 = ["::/0"]
+  } : {}
+
+  project       = var.project_id
+  name          = each.key == "ipv4" ? local.ssh_deny_ipv4_name : local.ssh_deny_ipv6_name
+  network       = local.network_self_link
+  direction     = "INGRESS"
+  priority      = 900
+  source_ranges = each.value
+  target_tags   = var.iap_ssh_target_tags
+
+  deny {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  deny {
+    protocol = "udp"
+    ports    = ["22"]
+  }
+
+  description = "Prevent unrestricted SSH ingress; use an approved private access path instead."
+}
+
+moved {
+  from = google_compute_firewall.deny_unrestricted_ssh[0]
+  to   = google_compute_firewall.deny_unrestricted_ssh["ipv4"]
+}
+
+resource "google_compute_firewall" "allow_iap_ssh" {
+  count = var.enable_iap_ssh ? 1 : 0
+
+  project       = var.project_id
+  name          = local.iap_ssh_name
+  network       = local.network_self_link
+  direction     = "INGRESS"
+  priority      = 800
+  source_ranges = ["35.235.240.0/20"]
+  target_tags   = var.iap_ssh_target_tags
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  description = "Allow SSH and SCP through Google Cloud IAP only."
+}
+
+locals {
   network_contract = {
     project_id                  = var.project_id
     environment                 = var.environment
@@ -128,6 +205,8 @@ locals {
     vpc_connector_subnet        = try(google_compute_subnetwork.connector[0].name, var.vpc_connector_subnet)
     vpc_connector_subnet_ip     = try(google_compute_subnetwork.connector[0].ip_cidr_range, var.vpc_connector_subnet_ip)
     firewall_rules              = { for key, rule in google_compute_firewall.rules : key => rule.name }
+    iap_ssh_rule                = try(google_compute_firewall.allow_iap_ssh[0].name, null)
+    ssh_deny_rule               = try(google_compute_firewall.deny_unrestricted_ssh["ipv4"].name, null)
     labels                      = var.labels
   }
 }

@@ -501,9 +501,17 @@ func (q *Queries) CountSandboxesByTeamPaged(ctx context.Context, arg CountSandbo
 }
 
 const createSandbox = `-- name: CreateSandbox :one
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $19::text, 0 FROM ins
+  RETURNING sandbox_id
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
 type CreateSandboxParams struct {
@@ -525,6 +533,34 @@ type CreateSandboxParams struct {
 	BasePath          *string       `json:"base_path"`
 	DeltaPath         *string       `json:"delta_path"`
 	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
+	PreviewAccess     string        `json:"preview_access"`
+}
+
+type CreateSandboxRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Name              string             `json:"name"`
+	Status            SandboxStatus      `json:"status"`
+	VcpuCount         int32              `json:"vcpu_count"`
+	MemoryMib         int32              `json:"memory_mib"`
+	HostID            string             `json:"host_id"`
+	IpAddress         *netip.Addr        `json:"ip_address"`
+	Pid               *int32             `json:"pid"`
+	SnapshotID        pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DestroyedAt       pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig     []byte             `json:"network_config"`
+	TimeoutSeconds    *int32             `json:"timeout_seconds"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -534,7 +570,10 @@ type CreateSandboxParams struct {
 // template_id is optional (NULL when sandbox is not derived from a template).
 // snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 // specific build's artifacts so a later template rebuild can't corrupt it.
-func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (Sandbox, error) {
+// The strict preview-policy row is created in this same statement: no caller
+// can observe a new sandbox through the rolling-deploy legacy fallback, and
+// quota admission remains statement-sized.
+func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (CreateSandboxRow, error) {
 	row := q.db.QueryRow(ctx, createSandbox,
 		arg.ID,
 		arg.TeamID,
@@ -554,8 +593,9 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 		arg.BasePath,
 		arg.DeltaPath,
 		arg.AutoDeleteSeconds,
+		arg.PreviewAccess,
 	)
-	var i Sandbox
+	var i CreateSandboxRow
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
@@ -592,10 +632,17 @@ WITH tpl AS (
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $21::text, 0 FROM ins
+  RETURNING sandbox_id
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
 type CreateSandboxFromTemplateParams struct {
@@ -619,13 +666,41 @@ type CreateSandboxFromTemplateParams struct {
 	BasePath          *string       `json:"base_path"`
 	DeltaPath         *string       `json:"delta_path"`
 	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
+	PreviewAccess     string        `json:"preview_access"`
+}
+
+type CreateSandboxFromTemplateRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Name              string             `json:"name"`
+	Status            SandboxStatus      `json:"status"`
+	VcpuCount         int32              `json:"vcpu_count"`
+	MemoryMib         int32              `json:"memory_mib"`
+	HostID            string             `json:"host_id"`
+	IpAddress         *netip.Addr        `json:"ip_address"`
+	Pid               *int32             `json:"pid"`
+	SnapshotID        pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DestroyedAt       pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig     []byte             `json:"network_config"`
+	TimeoutSeconds    *int32             `json:"timeout_seconds"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
 // during the INSERT, serializing with SoftDeleteTemplateIfUnused's FOR
 // UPDATE. Returns 0 rows if the template is missing, deleted, or not
 // visible to the caller.
-func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandboxFromTemplateParams) (Sandbox, error) {
+func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandboxFromTemplateParams) (CreateSandboxFromTemplateRow, error) {
 	row := q.db.QueryRow(ctx, createSandboxFromTemplate,
 		arg.ID,
 		arg.TeamID,
@@ -647,8 +722,9 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		arg.BasePath,
 		arg.DeltaPath,
 		arg.AutoDeleteSeconds,
+		arg.PreviewAccess,
 	)
-	var i Sandbox
+	var i CreateSandboxFromTemplateRow
 	err := row.Scan(
 		&i.ID,
 		&i.TeamID,
@@ -678,19 +754,272 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 	return i, err
 }
 
-const createSandboxPreviewPolicy = `-- name: CreateSandboxPreviewPolicy :exec
-INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
-VALUES ($1, $2, 0)
+const createSandboxFromTemplateWithSecrets = `-- name: CreateSandboxFromTemplateWithSecrets :one
+WITH tpl AS (
+  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  WHERE t.id = $1
+    AND t.deleted_at IS NULL
+    AND (t.team_id = $2 OR t.team_id = $3)
+  FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19 FROM tpl
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $20::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, ($21::uuid[])[i], ($22::text[])[i], ($23::text[])[i]
+  FROM ins, generate_subscripts($21::uuid[], 1) AS g(i)
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
-type CreateSandboxPreviewPolicyParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Access    string    `json:"access"`
+type CreateSandboxFromTemplateWithSecretsParams struct {
+	TemplateID        uuid.UUID     `json:"template_id"`
+	TeamID            uuid.UUID     `json:"team_id"`
+	SystemTeamID      uuid.UUID     `json:"system_team_id"`
+	ID                uuid.UUID     `json:"id"`
+	Name              string        `json:"name"`
+	Status            SandboxStatus `json:"status"`
+	VcpuCount         int32         `json:"vcpu_count"`
+	MemoryMib         int32         `json:"memory_mib"`
+	HostID            string        `json:"host_id"`
+	IpAddress         *netip.Addr   `json:"ip_address"`
+	Pid               *int32        `json:"pid"`
+	SnapshotID        pgtype.UUID   `json:"snapshot_id"`
+	TimeoutSeconds    *int32        `json:"timeout_seconds"`
+	Metadata          []byte        `json:"metadata"`
+	SnapshotPath      *string       `json:"snapshot_path"`
+	MemPath           *string       `json:"mem_path"`
+	BasePath          *string       `json:"base_path"`
+	DeltaPath         *string       `json:"delta_path"`
+	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
+	PreviewAccess     string        `json:"preview_access"`
+	SecretIds         []uuid.UUID   `json:"secret_ids"`
+	EnvKeys           []string      `json:"env_keys"`
+	ProxyTokens       []string      `json:"proxy_tokens"`
 }
 
-func (q *Queries) CreateSandboxPreviewPolicy(ctx context.Context, arg CreateSandboxPreviewPolicyParams) error {
-	_, err := q.db.Exec(ctx, createSandboxPreviewPolicy, arg.SandboxID, arg.Access)
-	return err
+type CreateSandboxFromTemplateWithSecretsRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Name              string             `json:"name"`
+	Status            SandboxStatus      `json:"status"`
+	VcpuCount         int32              `json:"vcpu_count"`
+	MemoryMib         int32              `json:"memory_mib"`
+	HostID            string             `json:"host_id"`
+	IpAddress         *netip.Addr        `json:"ip_address"`
+	Pid               *int32             `json:"pid"`
+	SnapshotID        pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DestroyedAt       pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig     []byte             `json:"network_config"`
+	TimeoutSeconds    *int32             `json:"timeout_seconds"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+}
+
+// CreateSandboxFromTemplate plus secret bindings in one statement (see
+// CreateSandboxWithSecrets for why the single statement matters). Returns
+// 0 rows if the template is missing, deleted, or not visible — then no
+// bindings are written either.
+func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg CreateSandboxFromTemplateWithSecretsParams) (CreateSandboxFromTemplateWithSecretsRow, error) {
+	row := q.db.QueryRow(ctx, createSandboxFromTemplateWithSecrets,
+		arg.TemplateID,
+		arg.TeamID,
+		arg.SystemTeamID,
+		arg.ID,
+		arg.Name,
+		arg.Status,
+		arg.VcpuCount,
+		arg.MemoryMib,
+		arg.HostID,
+		arg.IpAddress,
+		arg.Pid,
+		arg.SnapshotID,
+		arg.TimeoutSeconds,
+		arg.Metadata,
+		arg.SnapshotPath,
+		arg.MemPath,
+		arg.BasePath,
+		arg.DeltaPath,
+		arg.AutoDeleteSeconds,
+		arg.PreviewAccess,
+		arg.SecretIds,
+		arg.EnvKeys,
+		arg.ProxyTokens,
+	)
+	var i CreateSandboxFromTemplateWithSecretsRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.AutoDeleteSeconds,
+		&i.AutoDeleteAt,
+	)
+	return i, err
+}
+
+const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $19::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, ($20::uuid[])[i], ($21::text[])[i], ($22::text[])[i]
+  FROM ins, generate_subscripts($20::uuid[], 1) AS g(i)
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id
+`
+
+type CreateSandboxWithSecretsParams struct {
+	ID                uuid.UUID     `json:"id"`
+	TeamID            uuid.UUID     `json:"team_id"`
+	Name              string        `json:"name"`
+	Status            SandboxStatus `json:"status"`
+	VcpuCount         int32         `json:"vcpu_count"`
+	MemoryMib         int32         `json:"memory_mib"`
+	HostID            string        `json:"host_id"`
+	IpAddress         *netip.Addr   `json:"ip_address"`
+	Pid               *int32        `json:"pid"`
+	SnapshotID        pgtype.UUID   `json:"snapshot_id"`
+	TimeoutSeconds    *int32        `json:"timeout_seconds"`
+	Metadata          []byte        `json:"metadata"`
+	TemplateID        pgtype.UUID   `json:"template_id"`
+	SnapshotPath      *string       `json:"snapshot_path"`
+	MemPath           *string       `json:"mem_path"`
+	BasePath          *string       `json:"base_path"`
+	DeltaPath         *string       `json:"delta_path"`
+	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
+	PreviewAccess     string        `json:"preview_access"`
+	SecretIds         []uuid.UUID   `json:"secret_ids"`
+	EnvKeys           []string      `json:"env_keys"`
+	ProxyTokens       []string      `json:"proxy_tokens"`
+}
+
+type CreateSandboxWithSecretsRow struct {
+	ID                uuid.UUID          `json:"id"`
+	TeamID            uuid.UUID          `json:"team_id"`
+	Name              string             `json:"name"`
+	Status            SandboxStatus      `json:"status"`
+	VcpuCount         int32              `json:"vcpu_count"`
+	MemoryMib         int32              `json:"memory_mib"`
+	HostID            string             `json:"host_id"`
+	IpAddress         *netip.Addr        `json:"ip_address"`
+	Pid               *int32             `json:"pid"`
+	SnapshotID        pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DestroyedAt       pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig     []byte             `json:"network_config"`
+	TimeoutSeconds    *int32             `json:"timeout_seconds"`
+	Metadata          []byte             `json:"metadata"`
+	TemplateID        pgtype.UUID        `json:"template_id"`
+	SnapshotPath      *string            `json:"snapshot_path"`
+	MemPath           *string            `json:"mem_path"`
+	BasePath          *string            `json:"base_path"`
+	DeltaPath         *string            `json:"delta_path"`
+	DiskMib           int32              `json:"disk_mib"`
+	AutoDeleteSeconds *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt      pgtype.Timestamptz `json:"auto_delete_at"`
+}
+
+// CreateSandbox plus its strict preview policy and secret bindings in ONE
+// statement. Atomicity aside, the single statement is load-bearing for quota
+// enforcement: the insert's shard-counter admission is invisible to
+// concurrent quota checks until it commits, and a multi-statement transaction
+// would stretch that window across client round trips.
+func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandboxWithSecretsParams) (CreateSandboxWithSecretsRow, error) {
+	row := q.db.QueryRow(ctx, createSandboxWithSecrets,
+		arg.ID,
+		arg.TeamID,
+		arg.Name,
+		arg.Status,
+		arg.VcpuCount,
+		arg.MemoryMib,
+		arg.HostID,
+		arg.IpAddress,
+		arg.Pid,
+		arg.SnapshotID,
+		arg.TimeoutSeconds,
+		arg.Metadata,
+		arg.TemplateID,
+		arg.SnapshotPath,
+		arg.MemPath,
+		arg.BasePath,
+		arg.DeltaPath,
+		arg.AutoDeleteSeconds,
+		arg.PreviewAccess,
+		arg.SecretIds,
+		arg.EnvKeys,
+		arg.ProxyTokens,
+	)
+	var i CreateSandboxWithSecretsRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.AutoDeleteSeconds,
+		&i.AutoDeleteAt,
+	)
+	return i, err
 }
 
 const destroySandbox = `-- name: DestroySandbox :one

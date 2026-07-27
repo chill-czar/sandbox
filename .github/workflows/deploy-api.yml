@@ -270,19 +270,24 @@ jobs:
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${{ github.sha }}
 
-      - name: Deploy to Cloud Run
+      # use4 is the primary production cell — api.superserve.ai routes here — so
+      # it deploys FIRST, right after the image push, before the usw secondary
+      # cell. That way a transient failure updating or probing usw can't stop the
+      # job and leave the public primary on the old image. These steps are
+      # unguarded: use4 is the permanent primary, so a missing CLOUD_RUN_SERVICE_USE4
+      # must fail the deploy rather than silently skip the only primary update.
+      # use4 has a public invoker binding, so /health is a meaningful probe.
+      - name: Deploy use4 cell to Cloud Run
         run: |
-          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE }} \
+          gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
-            --region ${{ vars.GCP_REGION }} \
+            --region ${{ vars.GCP_REGION_USE4 }} \
             --project ${{ vars.GCP_PROJECT }}
 
-      # Cloud Run only auto-routes to the new revision while traffic tracks
-      # "latest"; force it so a leftover pin can't keep prod on the old one.
-      - name: Route traffic to the new revision
+      - name: Route use4 cell traffic to the new revision
         run: |
-          SVC=${{ vars.CLOUD_RUN_SERVICE }}
-          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+          ARGS="--region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
           LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
           SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
@@ -291,12 +296,10 @@ jobs:
           fi
           gcloud run services update-traffic $SVC --to-latest $ARGS
 
-      # A plain /health curl hits whatever serves traffic, so confirm the
-      # just-deployed revision is the one actually at 100%.
-      - name: Verify latest revision serves traffic
+      - name: Verify use4 cell latest revision serves traffic
         run: |
-          SVC=${{ vars.CLOUD_RUN_SERVICE }}
-          ARGS="--region ${{ vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          SVC=${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+          ARGS="--region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
           LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
           PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
@@ -309,10 +312,9 @@ jobs:
       # The usw cell deploys as steps in this job — not a separate job — for
       # the same reason CD Migrate's cell push is a step: a second job
       # referencing the production environment would double any approval
-      # gate. Steps run after the primary verify, so a bad rollout stops at
-      # the primary. The cell reuses the SHA-tagged image pushed above
-      # (Cloud Run pulls cross-region from Artifact Registry); steps skip
-      # until CLOUD_RUN_SERVICE_USW is set (repo-level variable).
+      # gate. Runs after the primary verify and the use4 primary cell above.
+      # Reuses the SHA-tagged image pushed above (Cloud Run pulls cross-region
+      # from Artifact Registry); steps skip until CLOUD_RUN_SERVICE_USW is set.
       - name: Deploy usw cell to Cloud Run
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         run: |

@@ -3,13 +3,14 @@ terraform {
 }
 
 resource "google_compute_instance" "this" {
-  project        = var.project_id
-  name           = var.instance_name
-  zone           = var.zone
-  machine_type   = var.machine_type
-  can_ip_forward = var.can_ip_forward
-  tags           = var.tags
-  labels         = var.labels
+  project                   = var.project_id
+  name                      = var.instance_name
+  zone                      = var.zone
+  machine_type              = var.machine_type
+  can_ip_forward            = var.can_ip_forward
+  allow_stopping_for_update = var.allow_stopping_for_update
+  tags                      = var.tags
+  labels                    = local.instance_labels
 
   boot_disk {
     auto_delete = true
@@ -66,7 +67,6 @@ resource "google_compute_instance" "this" {
     ignore_changes = [
       advanced_machine_features,
       boot_disk,
-      labels,
       metadata,
       network_interface[0].access_config,
       scheduling,
@@ -76,6 +76,15 @@ resource "google_compute_instance" "this" {
 }
 
 locals {
+  instance_labels = merge(
+    var.labels,
+    {
+      environment = var.environment
+      managed_by  = "terraform"
+      region      = var.region
+    },
+  )
+
   sandbox_host_contract = {
     project_id            = var.project_id
     environment           = var.environment
@@ -86,7 +95,7 @@ locals {
     subnet                = var.subnet
     internal_ip           = try(google_compute_instance.this.network_interface[0].network_ip, var.internal_ip)
     tags                  = var.tags
-    labels                = var.labels
+    labels                = local.instance_labels
     service_account_email = var.service_account_email
     boot_disk_image       = var.boot_disk_image
     boot_disk_size_gb     = var.boot_disk_size_gb

@@ -290,12 +290,18 @@ func runBuild(ctx context.Context, cfg buildConfig) error {
 	emitInternal("system", "baked context into boxd (user=%q workdir=%q env=%d)",
 		bc.user, bc.workdir, len(bc.env))
 
+	// Enable guest swap after build steps, before the snapshot (see
+	// GuestSwapSetupScript). Best-effort — the script swallows failures.
+	rootCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
+	if err := runShellCmdQuiet(ctx, netInfo.HostIP, builder.GuestSwapSetupScript, rootCtx); err != nil {
+		emitInternal("system", "guest swap setup skipped: %v", err)
+	}
+
 	// Push pending guest writes through virtio-block before snapshot —
 	// otherwise dirty pages only live in mem.snap and resumed sandboxes
 	// corrupt files when the kernel evicts them.
 	emitInternal("system", "syncing guest filesystem")
-	syncCtx := buildCtx{env: bc.env, user: "root", workdir: "/"}
-	if err := runShellCmd(ctx, netInfo.HostIP, "sync && sync", syncCtx); err != nil {
+	if err := runShellCmdQuiet(ctx, netInfo.HostIP, "sync && sync", rootCtx); err != nil {
 		return fmt.Errorf("guest sync: %w", err)
 	}
 
@@ -661,8 +667,21 @@ func runBuildStep(ctx context.Context, vmIP string, step builder.BuildStep, bc b
 	}
 }
 
+// runShellCmd runs a user build step: the command and its output stream to the
+// customer's build log.
 func runShellCmd(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
-	emitUser("system", "$ %s", truncate(cmd, 256))
+	return runShellCmdEmit(ctx, vmIP, cmd, bc, emitUser)
+}
+
+// runShellCmdQuiet runs an internal finalization step (e.g. swap setup, fs
+// sync): its command echo and output go to operator logs only, so the
+// customer's build log shows their build steps, not our plumbing.
+func runShellCmdQuiet(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
+	return runShellCmdEmit(ctx, vmIP, cmd, bc, emitInternal)
+}
+
+func runShellCmdEmit(ctx context.Context, vmIP, cmd string, bc buildCtx, emit func(string, string, ...any)) error {
+	emit("system", "$ %s", truncate(cmd, 256))
 
 	stepCtx, cancel := context.WithTimeout(ctx, stepTimeout)
 	defer cancel()
@@ -691,12 +710,12 @@ func runShellCmd(ctx context.Context, vmIP, cmd string, bc buildCtx) error {
 			case *pb.DataEvent_Stdout:
 				text := strings.TrimRight(string(o.Stdout), "\n")
 				if text != "" {
-					emitUser("stdout", "%s", text)
+					emit("stdout", "%s", text)
 				}
 			case *pb.DataEvent_Stderr:
 				text := strings.TrimRight(string(o.Stderr), "\n")
 				if text != "" {
-					emitUser("stderr", "%s", text)
+					emit("stderr", "%s", text)
 				}
 			}
 		case *pb.ProcessEvent_End:
@@ -841,6 +860,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest string `json:"resolved_digest"`
 		SizeBytes      int64  `json:"size_bytes"`
 		BuiltAt        string `json:"built_at"`
+		SwapMode       string `json:"swap_mode"` // see builder.SwapModeGuest
 	}{
 		SnapshotPath:   snapPath,
 		MemPath:        memPath,
@@ -850,6 +870,7 @@ func writeBuildMeta(dir, snapPath, memPath, basePath, deltaPath string, br build
 		ResolvedDigest: br.ResolvedDigest,
 		SizeBytes:      br.SizeBytes,
 		BuiltAt:        time.Now().UTC().Format(time.RFC3339),
+		SwapMode:       builder.SwapModeGuest,
 	}
 	data, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
