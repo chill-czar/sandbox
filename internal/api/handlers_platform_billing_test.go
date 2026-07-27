@@ -41,3 +41,30 @@ func TestParsePlatformBillingParams(t *testing.T) {
 		}
 	})
 }
+
+func TestPlatformBillingQuerySelection(t *testing.T) {
+	if got := platformBillingQueryForSort("team_name"); got != platformBillingMetadataQuery {
+		t.Fatal("team_name sort should use the metadata-paging query")
+	}
+	if got := platformBillingQueryForSort("created_at"); got != platformBillingMetadataQuery {
+		t.Fatal("created_at sort should use the metadata-paging query")
+	}
+	if got := platformBillingQueryForSort("current_charges_usd"); got != platformBillingChargesQuery {
+		t.Fatal("billing-derived sort should use the full billing query")
+	}
+}
+
+func TestPlatformBillingRequiredRateCountIgnoresFutureRates(t *testing.T) {
+	if !strings.Contains(platformBillingChargesQuery, "resource IN ('vcpu', 'memory_gib', 'storage_gib')") {
+		t.Fatal("required-rate count should only include the three billing resources")
+	}
+}
+
+func TestPlatformBillingStableSortingTreatsErrorsAsSecondaryKey(t *testing.T) {
+	if !strings.Contains(platformBillingChargesQuery, "CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END ASC") {
+		t.Fatal("billing sort should keep error rows behind successful rows")
+	}
+	if !strings.Contains(platformBillingChargesQuery, "lower(team_name) ASC") {
+		t.Fatal("billing sort should use team name as a stable secondary key")
+	}
+}
