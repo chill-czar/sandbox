@@ -140,6 +140,14 @@ func (s *LocalHTTPServer) handleInstance(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "instance not found", http.StatusNotFound)
 		return
 	}
+	if previewPolicyNeedsPortBrowserAuth(info) &&
+		!headerHasCapability(r.Header.Get(preview.ProxyCapabilitiesHeader), preview.HostCapabilityPortBrowserAuth) {
+		// A Phase 3 proxy can enforce header tokens but does not understand the
+		// browser carrier. Withhold the complete policy (and its credential
+		// generation) unless the live proxy explicitly attests browser support.
+		http.Error(w, "instance not found", http.StatusNotFound)
+		return
+	}
 
 	// This response attestation lets a new proxy distinguish an explicitly
 	// legacy sandbox served by a capable VMD from a response emitted by a VMD
@@ -225,7 +233,7 @@ func previewPortAccessToJSON(in map[int32]PreviewPortPolicy) map[string]string {
 func previewPortTokenVersionsToJSON(in map[int32]PreviewPortPolicy) map[string]int64 {
 	out := make(map[string]int64, len(in))
 	for port, policy := range in {
-		if policy.Access == preview.AccessPrivateTokenV1 && policy.TokenVersion > 0 {
+		if preview.IsTokenizedAccess(policy.Access) && policy.TokenVersion > 0 {
 			out[strconv.Itoa(int(port))] = policy.TokenVersion
 		}
 	}
@@ -250,7 +258,16 @@ func previewPolicyNeedsPortAccess(info InstanceInfo) bool {
 
 func previewPolicyNeedsPortTokens(info InstanceInfo) bool {
 	for _, policy := range info.PreviewPorts {
-		if policy.Access == preview.AccessPrivateTokenV1 {
+		if preview.IsTokenizedAccess(policy.Access) {
+			return true
+		}
+	}
+	return false
+}
+
+func previewPolicyNeedsPortBrowserAuth(info InstanceInfo) bool {
+	for _, policy := range info.PreviewPorts {
+		if policy.Access == preview.AccessPrivateBrowserV1 {
 			return true
 		}
 	}

@@ -96,6 +96,32 @@ func TestVMDResolverAttestsPreviewTokensOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestVMDResolverAttestsBrowserAuthOnlyWhenConfigured(t *testing.T) {
+	var gotCapabilities string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCapabilities = r.Header.Get(preview.ProxyCapabilitiesHeader)
+		attestPreviewProtocol(w)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"vm_ip": "10.0.0.2", "status": "running", "started_at": int64(123),
+		})
+	}))
+	defer server.Close()
+
+	resolver := NewVMDResolver(server.URL).WithPreviewBrowserAuth()
+	if _, err := resolver.Lookup(context.Background(), "vm-browser-aware"); err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	want := strings.Join([]string{
+		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
+	}, ", ")
+	if gotCapabilities != want {
+		t.Fatalf("%s = %q, want %q", preview.ProxyCapabilitiesHeader, gotCapabilities, want)
+	}
+}
+
 func TestVMDResolverDecodesParallelPortAccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attestPreviewProtocol(w)

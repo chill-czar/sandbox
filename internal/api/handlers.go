@@ -512,24 +512,21 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		respondError(c, ErrInternal)
 		return false
 	}
-	if resumePolicy.requiresTokenCapability() {
-		if !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
+	if resumePolicy.requiresBrowserCapability() {
+		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
 			return false
 		}
 		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
 		// revision. Advance under the sandbox row lock before restoring so the
-		// tokenized per-port entries always have a strictly newer ordering key.
+		// browser-authenticated per-port entries always have a strictly newer
+		// ordering key.
 		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
 			return nil
 		}, func(q *db.Queries, _ previewPolicySnapshot) error {
-			return validateHostPreviewCapabilities(c.Request.Context(), q, sandbox.HostID,
-				preview.HostCapabilityPorts,
-				preview.HostCapabilityPortAccess,
-				preview.HostCapabilityPortTokens,
-			)
+			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
 		})
 		if err != nil {
-			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewTokensForResume", err) {
+			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
 				return false
 			}
 		}
@@ -744,6 +741,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		pauseAndRevert()
 		respondError(c, ErrInternal)
 		return false
+	}
+	// A private publication may have changed while the VM was restoring. Gate
+	// the final authoritative reapply against the host's current browser
+	// heartbeat too; otherwise a resume that began public could activate a
+	// concurrently-added browser policy on a downgraded host.
+	if currentPolicy.requiresBrowserCapability() {
+		if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+			pauseAndRevert()
+			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+			return false
+		}
 	}
 	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
 		if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
@@ -1788,10 +1796,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var hostID string
 	requiredCapabilities := []string{preview.HostCapabilityPorts}
 	if previewAccess == preview.AccessPrivate {
-		requiredCapabilities = append(requiredCapabilities,
-			preview.HostCapabilityPortAccess,
-			preview.HostCapabilityPortTokens,
-		)
+		requiredCapabilities = previewBrowserCapabilities()
 	}
 	if h.Scheduler != nil {
 		hostID, err = h.Scheduler.SelectHost(c.Request.Context(), requiredCapabilities)
@@ -1811,7 +1816,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// are only hints; heartbeat capability state can change between selection
 	// and VM creation.
 	if previewAccess == preview.AccessPrivate {
-		if !h.requireHostPreviewPortTokens(c, hostID) {
+		if !h.requireHostPreviewPortBrowserAuth(c, hostID) {
 			return
 		}
 	} else if !h.requireHostPreviewPorts(c, hostID) {
@@ -2769,20 +2774,20 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 }
 
 func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID, access string) bool {
-	requiresTokens := access == preview.AccessPrivate
-	if !requiresTokens {
+	requiresBrowserAuth := access == preview.AccessPrivate
+	if !requiresBrowserAuth {
 		current, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandbox.ID, teamID)
 		if err != nil {
 			log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("load preview policy before access update failed")
 			respondError(c, ErrInternal)
 			return false
 		}
-		requiresTokens = current.hasPrivatePorts()
+		requiresBrowserAuth = current.hasPrivatePorts()
 	}
-	if requiresTokens && !h.requireHostPreviewPortTokens(c, sandbox.HostID) {
+	if requiresBrowserAuth && !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
 		return false
 	}
-	if !requiresTokens && !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
+	if !requiresBrowserAuth && !h.requireHostPreviewPortAccess(c, sandbox.HostID) {
 		return false
 	}
 	var updated int64

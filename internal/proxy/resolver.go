@@ -85,6 +85,11 @@ type VMDResolver struct {
 	// It keeps the local protocol attestation honest when token auth is not
 	// configured, causing VMD to withhold tokenized instances instead.
 	previewTokens bool
+	// previewBrowserAuth is enabled only by a proxy build which implements the
+	// browser sentinel's carrier parsing, cookie bootstrap, and scrubbing. It is
+	// separate from previewTokens so the local protocol exposes the Phase 4
+	// deploy boundary honestly.
+	previewBrowserAuth bool
 
 	mu sync.Mutex
 	// epoch advances on any explicit invalidation. It is part of the
@@ -102,6 +107,15 @@ type VMDResolver struct {
 // and can enforce HostCapabilityPortTokens. Configure it once at startup.
 func (r *VMDResolver) WithPreviewTokens() *VMDResolver {
 	r.previewTokens = true
+	return r
+}
+
+// WithPreviewBrowserAuth declares that the owning proxy can enforce
+// HostCapabilityPortBrowserAuth. Browser support is additive to header tokens,
+// so this also enables the token capability if the caller did not do so first.
+func (r *VMDResolver) WithPreviewBrowserAuth() *VMDResolver {
+	r.previewTokens = true
+	r.previewBrowserAuth = true
 	return r
 }
 
@@ -177,6 +191,9 @@ func (r *VMDResolver) fetch(ctx context.Context, instanceID string, epoch uint64
 	capabilities := preview.HostCapabilityPortAccess
 	if r.previewTokens {
 		capabilities += ", " + preview.HostCapabilityPortTokens
+		if r.previewBrowserAuth {
+			capabilities += ", " + preview.HostCapabilityPortBrowserAuth
+		}
 	}
 	req.Header.Set(preview.ProxyCapabilitiesHeader, capabilities)
 

@@ -81,10 +81,10 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 	ctx := context.Background()
 
 	public := []string{preview.HostCapabilityPorts}
-	private := []string{preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
+	private := []string{preview.HostCapabilityPortBrowserAuth, preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess, preview.HostCapabilityPorts}
 	for _, required := range [][]string{public, public, private, {
 		preview.HostCapabilityPorts, preview.HostCapabilityPortTokens, preview.HostCapabilityPortAccess,
-		preview.HostCapabilityPorts, preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth, preview.HostCapabilityPorts, preview.HostCapabilityPortTokens,
 	}} {
 		if got, err := s.SelectHost(ctx, required); err != nil || got != "fallback" {
 			t.Fatalf("SelectHost(%v) = (%q, %v), want fallback", required, got, err)
@@ -96,6 +96,7 @@ func TestLeastLoadedCachesCandidateSetsByCanonicalCapabilities(t *testing.T) {
 	}
 	wantPrivate := []string{
 		preview.HostCapabilityPortAccess,
+		preview.HostCapabilityPortBrowserAuth,
 		preview.HostCapabilityPortTokens,
 		preview.HostCapabilityPorts,
 	}

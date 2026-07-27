@@ -274,12 +274,39 @@ func TestUpdateSandboxPreviewPolicyEqualRevisionIncludesNormalizedTokenState(t *
 			wantCode:            codes.OK,
 		},
 		{
+			name:                "same live browser snapshot normalizes top-level access",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 7}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPublic,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 7}},
+			wantCode:            codes.OK,
+		},
+		{
+			name:                "header and browser sentinels are not equality aliases",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPrivate,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 7}},
+			wantCode:            codes.FailedPrecondition,
+		},
+		{
 			name:                "live token generation disagreement",
 			storedAccess:        preview.AccessPrivate,
 			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 7}},
 			storedTokenRevision: revision,
 			incomingAccess:      preview.AccessPrivate,
 			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateTokenV1, TokenVersion: 8}},
+			wantCode:            codes.FailedPrecondition,
+		},
+		{
+			name:                "live browser generation disagreement",
+			storedAccess:        preview.AccessPrivate,
+			storedPorts:         map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 7}},
+			storedTokenRevision: revision,
+			incomingAccess:      preview.AccessPrivate,
+			incomingPorts:       map[int32]PreviewPortPolicy{3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 8}},
 			wantCode:            codes.FailedPrecondition,
 		},
 		{
@@ -852,6 +879,84 @@ func TestTokenizedPreviewPolicyRoundTripAndRollbackWatermark(t *testing.T) {
 	}
 }
 
+func TestBrowserPreviewPolicyRoundTripAndPhaseThreeRollbackWatermark(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	s, err := OpenStateStore(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	const vmID = "vm-browser-watermark"
+	if err := s.Put(VMRecord{
+		ID:            vmID,
+		PreviewAccess: preview.AccessPrivate,
+		PreviewPorts:  map[int32]bool{3000: true},
+		PreviewPortAccess: map[int32]string{
+			3000: preview.AccessPrivateBrowserV1,
+		},
+		PreviewPortTokenVersions: map[int32]int64{3000: 5},
+		PreviewPolicyRevision:    10, PreviewTokenPolicyRevision: 10,
+	}); err != nil {
+		s.Close()
+		t.Fatalf("Put browser policy: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s, err = OpenStateStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s.Close()
+	got, err := s.Get(vmID)
+	if err != nil {
+		t.Fatalf("Get browser policy: %v", err)
+	}
+	if got.PreviewPortAccess[3000] != preview.AccessPrivateBrowserV1 ||
+		got.PreviewPortTokenVersions[3000] != 5 || got.PreviewTokenPolicyRevision != 10 {
+		t.Fatalf("restored browser policy = %+v", got)
+	}
+
+	// A rolled-back Phase 3 VMD knows the access sidecar field but not the
+	// browser sentinel. When it advances or rewrites the policy, it clears the
+	// token generation and watermark. Phase 4 must treat that durable snapshot
+	// as closed and must not revive the older browser credential.
+	phaseThreeSidecar := []byte(`{"access":"private","ports":{"3000":true},"port_access":{"3000":"private_browser_v1"},"revision":11,"future_guard":{"mode":"closed"}}`)
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(previewPolicyBucketName).Put([]byte(vmID), phaseThreeSidecar)
+	}); err != nil {
+		t.Fatalf("simulate Phase 3 sidecar write: %v", err)
+	}
+
+	got, err = s.Get(vmID)
+	if err != nil {
+		t.Fatalf("Get after Phase 3 write: %v", err)
+	}
+	if got.PreviewPolicyRevision != 11 || got.PreviewPortAccess[3000] != preview.AccessPrivateBrowserV1 ||
+		len(got.PreviewPortTokenVersions) != 0 || got.PreviewTokenPolicyRevision != 0 {
+		t.Fatalf("rolled-back Phase 3 state activated browser credentials: %+v", got)
+	}
+
+	inst := toInstance(*got)
+	mgr := &Manager{vms: map[string]*VMInstance{vmID: inst}}
+	if err := mgr.UpdateSandboxPreviewPolicy(vmID, preview.AccessPrivate, map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 6},
+	}, 10); err != nil {
+		t.Fatalf("stale Phase 4 update: %v", err)
+	}
+	if inst.PreviewPolicyRevision != 11 || inst.PreviewPorts[3000].TokenVersion != 0 ||
+		inst.PreviewTokenPolicyRevision != 0 {
+		t.Fatalf("stale Phase 4 update revived browser credentials: %+v", inst)
+	}
+
+	err = mgr.UpdateSandboxPreviewPolicy(vmID, preview.AccessPrivate, map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 6},
+	}, 11)
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("equal-revision browser credential revival = %v, want FailedPrecondition", err)
+	}
+}
+
 func TestTokenPolicyNormalizationFailsClosed(t *testing.T) {
 	ports, watermark := normalizePreviewTokenPolicy(map[int32]PreviewPortPolicy{
 		3000: {Access: preview.AccessPrivateTokenV1},
@@ -866,6 +971,22 @@ func TestTokenPolicyNormalizationFailsClosed(t *testing.T) {
 	}, 8, 7)
 	if watermark != 0 || ports[3000].TokenVersion != 0 {
 		t.Fatalf("stale watermark normalized to (%#v, %d), want closed", ports, watermark)
+	}
+
+	ports, watermark = normalizePreviewTokenPolicy(map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateBrowserV1, TokenVersion: 4},
+		3001: {Access: preview.AccessPrivateTokenV1, TokenVersion: 5},
+	}, 9, 9)
+	if watermark != 9 || ports[3000].TokenVersion != 4 || ports[3001].TokenVersion != 5 {
+		t.Fatalf("mixed tokenized snapshot normalized to (%#v, %d), want both generations live", ports, watermark)
+	}
+
+	ports, watermark = normalizePreviewTokenPolicy(map[int32]PreviewPortPolicy{
+		3000: {Access: preview.AccessPrivateBrowserV1},
+		3001: {Access: preview.AccessPrivateTokenV1, TokenVersion: 5},
+	}, 10, 10)
+	if watermark != 0 || ports[3000].TokenVersion != 0 || ports[3001].TokenVersion != 0 {
+		t.Fatalf("malformed browser snapshot normalized to (%#v, %d), want all generations closed", ports, watermark)
 	}
 }
 

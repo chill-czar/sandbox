@@ -1066,7 +1066,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 	}
 }
 
-func TestResumeSandbox_PrivatePolicyAdvancesRevisionAndRestoresTokenizedPorts(t *testing.T) {
+func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(t *testing.T) {
 	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
 	sb.HostID = "token-host"
@@ -1089,16 +1089,17 @@ func TestResumeSandbox_PrivatePolicyAdvancesRevisionAndRestoresTokenizedPorts(t 
 		},
 	}
 
-	var capabilityChecks, revisionBumps int
+	var capabilityRequirements [][]string
+	var revisionBumps int
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 8)
 			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
-				capabilityChecks++
+				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
 				return scalarUUIDRow(sandboxID)
@@ -1137,16 +1138,21 @@ func TestResumeSandbox_PrivatePolicyAdvancesRevisionAndRestoresTokenizedPorts(t 
 		t.Fatalf("status=%d want 200; body=%s", w.Code, w.Body.String())
 	}
 	h.WaitAsyncBookkeeping()
-	if capabilityChecks != 2 || revisionBumps != 1 {
-		t.Fatalf("capability checks=%d revision bumps=%d, want 2/1", capabilityChecks, revisionBumps)
+	if len(capabilityRequirements) != 3 || revisionBumps != 1 {
+		t.Fatalf("capability checks=%d revision bumps=%d, want 3/1", len(capabilityRequirements), revisionBumps)
+	}
+	for _, got := range capabilityRequirements {
+		if !slices.Equal(got, previewBrowserCapabilities()) {
+			t.Fatalf("private resume capabilities=%v, want %v", got, previewBrowserCapabilities())
+		}
 	}
 	for name, got := range map[string]previewPolicySnapshot{"restore": restored, "reconcile": reconciled} {
 		if got.Access != preview.AccessPrivate || got.Revision != 8 {
 			t.Fatalf("%s top-level policy=(%q,%d), want raw private revision 8", name, got.Access, got.Revision)
 		}
 		port := got.Ports[3000]
-		if len(got.Ports) != 1 || port.Access != preview.AccessPrivateTokenV1 || port.TokenVersion != 12 {
-			t.Fatalf("%s ports=%#v, want tokenized 3000 v12", name, got.Ports)
+		if len(got.Ports) != 1 || port.Access != preview.AccessPrivateBrowserV1 || port.TokenVersion != 12 {
+			t.Fatalf("%s ports=%#v, want browser-authenticated 3000 v12", name, got.Ports)
 		}
 	}
 }
@@ -1836,7 +1842,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 }
 
-func TestCreateSandbox_PrivateUsesTokenCapablePlacementAndAttestation(t *testing.T) {
+func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testing.T) {
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 	scheduler := &stubScheduler{hostID: "private-host"}
@@ -1901,6 +1907,7 @@ func TestCreateSandbox_PrivateUsesTokenCapablePlacementAndAttestation(t *testing
 		preview.HostCapabilityPorts,
 		preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
 	}
 	if !reflect.DeepEqual(scheduler.required, wantCaps) {
 		t.Fatalf("scheduler requirements = %#v, want %#v", scheduler.required, wantCaps)
@@ -1925,7 +1932,7 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 				return templateRow(defaultReadyTemplate())
 			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 				checks++
-				return scalarBoolRow(!slices.Contains(args[0].([]string), preview.HostCapabilityPortTokens))
+				return scalarBoolRow(!slices.Contains(args[0].([]string), preview.HostCapabilityPortBrowserAuth))
 			case strings.Contains(sql, "INSERT INTO sandbox"):
 				inserted = true
 				return errorRow(fmt.Errorf("insert must not run after capability rollback"))

@@ -41,3 +41,29 @@ func TestRestrictiveFallback(t *testing.T) {
 		})
 	}
 }
+
+func TestIsTokenizedAccess(t *testing.T) {
+	for _, access := range []string{AccessPrivateTokenV1, AccessPrivateBrowserV1} {
+		if !IsTokenizedAccess(access) {
+			t.Fatalf("IsTokenizedAccess(%q) = false", access)
+		}
+	}
+	for _, access := range []string{"", AccessLegacyPublic, AccessPublic, AccessPrivate, "future"} {
+		if IsTokenizedAccess(access) {
+			t.Fatalf("IsTokenizedAccess(%q) = true", access)
+		}
+	}
+}
+
+func TestIsPrivateAccessIncludesDatabaseAndWireModes(t *testing.T) {
+	for _, access := range []string{AccessPrivate, AccessPrivateTokenV1, AccessPrivateBrowserV1} {
+		if !IsPrivateAccess(access) {
+			t.Fatalf("IsPrivateAccess(%q) = false", access)
+		}
+	}
+	for _, access := range []string{"", AccessLegacyPublic, AccessPublic, "future"} {
+		if IsPrivateAccess(access) {
+			t.Fatalf("IsPrivateAccess(%q) = true", access)
+		}
+	}
+}

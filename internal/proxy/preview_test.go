@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,6 +165,7 @@ func TestPreviewHeaderTokenAuthenticationMatrix(t *testing.T) {
 		{name: "expired", info: tokenized, seed: seed, values: []string{expired}},
 		{name: "tampered", info: tokenized, seed: seed, values: []string{tampered}},
 		{name: "multiple including valid", info: tokenized, seed: seed, values: []string{valid, "malformed"}},
+		{name: "comma-coalesced including valid", info: tokenized, seed: seed, values: []string{"stale, " + valid}},
 		{name: "sentinel zero version", info: InstanceInfo{
 			PreviewAccess:     preview.AccessPrivate,
 			PreviewPorts:      map[int]struct{}{port: {}},
@@ -285,4 +288,386 @@ func TestPreviewCredentialHeaderIsScrubbedBeforePublicAndPrivateUpstreams(t *tes
 		PreviewPortAccess:        map[int]string{port: preview.AccessPrivateTokenV1},
 		PreviewPortTokenVersions: map[int]int64{port: 3},
 	}, token)
+}
+
+func browserPreviewTestPolicy(port int, version int64) InstanceInfo {
+	return InstanceInfo{
+		PreviewAccess:            preview.AccessPrivate,
+		PreviewPorts:             map[int]struct{}{port: {}},
+		PreviewPortAccess:        map[int]string{port: preview.AccessPrivateBrowserV1},
+		PreviewPortTokenVersions: map[int]int64{port: version},
+	}
+}
+
+func mintPreviewTestToken(t *testing.T, seed []byte, sandboxID string, port int, version int64) string {
+	t.Helper()
+	token, err := auth.ComputePreviewToken(seed, auth.PreviewClaims{
+		SandboxID: sandboxID,
+		Port:      port,
+		Version:   version,
+	})
+	if err != nil {
+		t.Fatalf("ComputePreviewToken: %v", err)
+	}
+	return token
+}
+
+func TestPreviewBrowserSentinelAcceptsIndependentCarrierValues(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+		version   = int64(7)
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, version)
+	info := browserPreviewTestPolicy(port, version)
+
+	tests := []struct {
+		name  string
+		build func(*http.Request)
+	}{
+		{name: "header after stale header", build: func(r *http.Request) {
+			r.Header.Add(auth.PreviewTokenHeader, "stale")
+			r.Header.Add(auth.PreviewTokenHeader, valid)
+		}},
+		{name: "header after stale comma-coalesced value", build: func(r *http.Request) {
+			r.Header.Set(auth.PreviewTokenHeader, "stale, "+valid)
+		}},
+		{name: "cookie after malformed and stale cookie", build: func(r *http.Request) {
+			r.Header.Add("Cookie", "malformed; "+auth.PreviewTokenCookie+"=stale; "+auth.PreviewTokenCookie+"="+valid)
+		}},
+		{name: "query after stale query", build: func(r *http.Request) {
+			r.URL.RawQuery = auth.PreviewTokenQueryParam + "=stale&" + auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
+		}},
+		{name: "fresh cookie despite stale header", build: func(r *http.Request) {
+			r.Header.Set(auth.PreviewTokenHeader, "stale")
+			r.Header.Add("Cookie", auth.PreviewTokenCookie+"="+valid)
+		}},
+		{name: "fresh query despite stale cookie", build: func(r *http.Request) {
+			r.Header.Add("Cookie", auth.PreviewTokenCookie+"=stale")
+			r.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// POST exercises direct query acceptance rather than the GET
+			// bootstrap, which is covered separately below.
+			req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
+			tt.build(req)
+			w := httptest.NewRecorder()
+			if !enforcePreviewPublication(w, req, sandboxID, port, info, seed) {
+				t.Fatalf("browser carrier denied: status=%d body=%q", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestPreviewBrowserSentinelDoesNotWeakenPhaseThreeCarrierBoundary(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+		version   = int64(7)
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, version)
+	phaseThree := InstanceInfo{
+		PreviewAccess:            preview.AccessPrivate,
+		PreviewPorts:             map[int]struct{}{port: {}},
+		PreviewPortAccess:        map[int]string{port: preview.AccessPrivateTokenV1},
+		PreviewPortTokenVersions: map[int]int64{port: version},
+	}
+
+	for _, carrier := range []string{"cookie", "query"} {
+		t.Run(carrier, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
+			if carrier == "cookie" {
+				req.Header.Add("Cookie", auth.PreviewTokenCookie+"="+valid)
+			} else {
+				req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
+			}
+			w := httptest.NewRecorder()
+			if enforcePreviewPublication(w, req, sandboxID, port, phaseThree, seed) {
+				t.Fatalf("Phase 3 sentinel accepted %s carrier", carrier)
+			}
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", w.Code)
+			}
+		})
+	}
+
+	// A browser sentinel with no exact generation is also closed.
+	info := browserPreviewTestPolicy(port, 0)
+	req := httptest.NewRequest(http.MethodGet, "http://unused/path", nil)
+	req.Header.Set(auth.PreviewTokenHeader, valid)
+	w := httptest.NewRecorder()
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed) || w.Code != http.StatusUnauthorized {
+		t.Fatalf("zero-generation browser policy = allowed/status %d", w.Code)
+	}
+}
+
+func TestPreviewBrowserQueryBootstrapIsSecureAndSameOrigin(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+		version   = int64(7)
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, version)
+	info := browserPreviewTestPolicy(port, version)
+
+	req := httptest.NewRequest(http.MethodGet, "http://unused/", nil)
+	req.Host = "3000-" + sandboxID + ".sandbox.test"
+	// A signed query must bootstrap even when another carrier already
+	// authenticates the request, otherwise the live token remains in browser
+	// history and referrers.
+	req.Header.Set(auth.PreviewTokenHeader, valid)
+	req.Header.Add("Cookie", auth.PreviewTokenCookie+"="+valid)
+	// A double-slash path would turn the old relative Location into a
+	// network-path redirect. Raw unrelated query bytes must not be normalized.
+	req.URL.Path = "//evil.example/dash"
+	req.URL.RawPath = "//evil.example/%64ash"
+	req.URL.RawQuery = "keep=%2f&" + auth.PreviewTokenQueryParam + "=stale&space=a+b&" +
+		"superserve%5fpreview_token=" + url.QueryEscape(valid) + "&bad=%zz"
+	w := httptest.NewRecorder()
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed) {
+		t.Fatal("bootstrap request was forwarded instead of redirected")
+	}
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%q", w.Code, w.Body.String())
+	}
+
+	location, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if location.Scheme != "https" || location.Host != req.Host || location.Path != "//evil.example/dash" {
+		t.Fatalf("unsafe redirect Location = %q", location.String())
+	}
+	if location.RawPath != req.URL.RawPath {
+		t.Fatalf("redirect raw path = %q, want %q", location.RawPath, req.URL.RawPath)
+	}
+	if location.RawQuery != "keep=%2f&space=a+b&bad=%zz" {
+		t.Fatalf("redirect query = %q, want raw unrelated values preserved", location.RawQuery)
+	}
+	if strings.Contains(w.Header().Get("Location"), valid) || strings.Contains(w.Header().Get("Location"), auth.PreviewTokenQueryParam) {
+		t.Fatalf("redirect retained preview credential: %q", w.Header().Get("Location"))
+	}
+	if w.Header().Get("Cache-Control") != "no-store" || w.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("bootstrap security headers = Cache-Control %q Referrer-Policy %q", w.Header().Get("Cache-Control"), w.Header().Get("Referrer-Policy"))
+	}
+
+	setCookie, err := http.ParseSetCookie(w.Header().Get("Set-Cookie"))
+	if err != nil {
+		t.Fatalf("ParseSetCookie: %v", err)
+	}
+	if setCookie.Name != auth.PreviewTokenCookie || setCookie.Value != valid || setCookie.Path != "/" ||
+		!setCookie.Secure || !setCookie.HttpOnly || setCookie.SameSite != http.SameSiteNoneMode ||
+		!setCookie.Partitioned || setCookie.Domain != "" {
+		t.Fatalf("bootstrap cookie is not host-only/secure: %+v", setCookie)
+	}
+}
+
+func TestPreviewBrowserQueryBootstrapRejectsInvalidTokenWithoutCookie(t *testing.T) {
+	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	req := httptest.NewRequest(http.MethodGet, "http://unused/?"+auth.PreviewTokenQueryParam+"=invalid", nil)
+	w := httptest.NewRecorder()
+	if enforcePreviewPublication(w, req, sandboxID, 3000, browserPreviewTestPolicy(3000, 1), seed) {
+		t.Fatal("invalid signed link was allowed")
+	}
+	if w.Code != http.StatusUnauthorized || w.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("invalid bootstrap status/cookie = %d / %q", w.Code, w.Header().Get("Set-Cookie"))
+	}
+}
+
+func TestPreviewBrowserQueryBootstrapPreservesEmptyQueryComponent(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, 1)
+	req := httptest.NewRequest(http.MethodGet, "http://unused/path", nil)
+	req.Host = "3000-" + sandboxID + ".sandbox.test"
+	req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid) + "&"
+
+	w := httptest.NewRecorder()
+	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, 1), seed) {
+		t.Fatal("bootstrap request was forwarded instead of redirected")
+	}
+	want := "https://" + req.Host + "/path?"
+	if got := w.Header().Get("Location"); got != want {
+		t.Fatalf("Location = %q, want preserved empty query component %q", got, want)
+	}
+}
+
+func TestPreviewBrowserQueryRedirectExceptions(t *testing.T) {
+	const (
+		sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+		port      = 3000
+	)
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, 1)
+	info := browserPreviewTestPolicy(port, 1)
+
+	tests := []struct {
+		name       string
+		method     string
+		upgrade    string
+		connection string
+		wantDirect bool
+	}{
+		{name: "post", method: http.MethodPost, wantDirect: true},
+		{name: "real websocket", method: http.MethodGet, upgrade: "websocket", connection: "keep-alive, Upgrade", wantDirect: true},
+		{name: "upgrade without connection", method: http.MethodGet, upgrade: "websocket"},
+		{name: "unrelated upgrade", method: http.MethodGet, upgrade: "h2c", connection: "upgrade"},
+		{name: "ordinary get", method: http.MethodGet},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, "http://unused/path?"+auth.PreviewTokenQueryParam+"="+url.QueryEscape(valid), nil)
+			req.Header.Set("Upgrade", tt.upgrade)
+			req.Header.Set("Connection", tt.connection)
+			w := httptest.NewRecorder()
+			got := enforcePreviewPublication(w, req, sandboxID, port, info, seed)
+			if got != tt.wantDirect {
+				t.Fatalf("direct = %v, want %v; status=%d", got, tt.wantDirect, w.Code)
+			}
+			if !tt.wantDirect && w.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302", w.Code)
+			}
+		})
+	}
+}
+
+func TestPreviewBrowserOnlyBypassesGenuineCORSPreflight(t *testing.T) {
+	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	info := browserPreviewTestPolicy(3000, 1)
+	for _, tt := range []struct {
+		name   string
+		origin string
+		acrm   string
+		want   bool
+	}{
+		{name: "real", origin: "https://console.example", acrm: http.MethodGet, want: true},
+		{name: "plain options"},
+		{name: "origin only", origin: "https://console.example"},
+		{name: "method only", acrm: http.MethodGet},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodOptions, "http://unused/path", nil)
+			req.Header.Set("Origin", tt.origin)
+			req.Header.Set("Access-Control-Request-Method", tt.acrm)
+			w := httptest.NewRecorder()
+			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed); got != tt.want {
+				t.Fatalf("allowed = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScrubPreviewCredentialsPreservesUnrelatedRawValues(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
+	req.URL.RawQuery = "before=%2f&" + auth.PreviewTokenQueryParam + "=one&bad=%zz&superserve%5fpreview_token=two&after=a+b"
+	req.Header[auth.PreviewTokenHeader] = []string{"one", "two"}
+	req.Header["x-superserve-preview-token"] = []string{"three"}
+	req.Header["Cookie"] = []string{
+		`quoted="application value"; ` + auth.PreviewTokenCookie + `=one; malformed; keep=1`,
+		auth.PreviewTokenCookie + `=two; similar_` + auth.PreviewTokenCookie + `=keep-too`,
+	}
+	req.Header["cOoKiE"] = []string{`other=%zz; ` + auth.PreviewTokenCookie + `=three`}
+
+	scrubPreviewCredentials(req)
+	if got := headerValues(req.Header, auth.PreviewTokenHeader); len(got) != 0 {
+		t.Fatalf("reserved header survived: %#v", got)
+	}
+	if req.URL.RawQuery != "before=%2f&bad=%zz&after=a+b" {
+		t.Fatalf("raw query = %q", req.URL.RawQuery)
+	}
+	cookies := strings.Join(headerValues(req.Header, "Cookie"), " | ")
+	if values := previewCookieTokens(req.Header); len(values) != 0 {
+		t.Fatalf("reserved cookie survived: %#v in %q", values, cookies)
+	}
+	for _, want := range []string{`quoted="application value"`, "malformed", "keep=1", "similar_" + auth.PreviewTokenCookie + "=keep-too", "other=%zz"} {
+		if !strings.Contains(cookies, want) {
+			t.Fatalf("unrelated cookie %q lost from %q", want, cookies)
+		}
+	}
+}
+
+func TestScrubPreviewCredentialsPreservesBareQueryDelimiter(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://unused/path?", nil)
+	if !req.URL.ForceQuery {
+		t.Fatal("test request did not retain its bare query delimiter")
+	}
+	scrubPreviewCredentials(req)
+	if req.URL.RawQuery != "" || !req.URL.ForceQuery {
+		t.Fatalf("credential-free query changed to RawQuery=%q ForceQuery=%v", req.URL.RawQuery, req.URL.ForceQuery)
+	}
+
+	req.URL.RawQuery = auth.PreviewTokenQueryParam + "=secret&"
+	req.URL.ForceQuery = false
+	scrubPreviewCredentials(req)
+	if req.URL.RawQuery != "" || !req.URL.ForceQuery {
+		t.Fatalf("empty component after credential scrub = RawQuery=%q ForceQuery=%v", req.URL.RawQuery, req.URL.ForceQuery)
+	}
+}
+
+func TestPreviewCredentialsAreScrubbedBeforePublicAndBrowserUpstreams(t *testing.T) {
+	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	type captured struct {
+		header   http.Header
+		rawQuery string
+	}
+	received := make(chan captured, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- captured{header: r.Header.Clone(), rawQuery: r.URL.RawQuery}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+
+	resolver := &stubResolver{}
+	handler := NewHandler([]string{"sandbox.test"}, resolver, zerolog.Nop()).WithAuth(seed)
+	valid := mintPreviewTestToken(t, seed, sandboxID, port, 3)
+	request := func(info InstanceInfo, authenticate bool) {
+		t.Helper()
+		resolver.info = info
+		req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
+		req.Host = fmt.Sprintf("%d-%s.sandbox.test", port, sandboxID)
+		req.URL.RawQuery = "keep=%2f&" + auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
+		req.Header.Add("Cookie", "app_session=keep; "+auth.PreviewTokenCookie+"=stale")
+		req.Header["x-superserve-preview-token"] = []string{"stale"}
+		if authenticate {
+			req.Header.Add(auth.PreviewTokenHeader, valid)
+		}
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%q", w.Code, w.Body.String())
+		}
+		got := <-received
+		if len(headerValues(got.header, auth.PreviewTokenHeader)) != 0 || strings.Contains(got.rawQuery, auth.PreviewTokenQueryParam) {
+			t.Fatalf("upstream received reserved header/query: %#v %q", got.header, got.rawQuery)
+		}
+		cookieHeader := strings.Join(headerValues(got.header, "Cookie"), ";")
+		if strings.Contains(cookieHeader, auth.PreviewTokenCookie) || !strings.Contains(cookieHeader, "app_session=keep") {
+			t.Fatalf("upstream cookies = %q", cookieHeader)
+		}
+		if got.rawQuery != "keep=%2f" {
+			t.Fatalf("upstream query = %q", got.rawQuery)
+		}
+	}
+
+	request(InstanceInfo{
+		VMIP: "127.0.0.1", Status: "running", StartedAt: 1,
+		PreviewAccess:     preview.AccessPublic,
+		PreviewPorts:      map[int]struct{}{port: {}},
+		PreviewPortAccess: map[int]string{port: preview.AccessPublic},
+	}, false)
+	private := browserPreviewTestPolicy(port, 3)
+	private.VMIP, private.Status, private.StartedAt = "127.0.0.1", "running", 1
+	request(private, true)
 }

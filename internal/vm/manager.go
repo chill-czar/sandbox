@@ -113,7 +113,8 @@ type VMInstance struct {
 	PreviewPolicyRevision int64
 	// PreviewTokenPolicyRevision must exactly match PreviewPolicyRevision for
 	// any per-port token generation to be active. A mismatched watermark is a
-	// durable signal that a rolled-back Phase 2 writer advanced the policy.
+	// durable signal that an older writer advanced the policy without the
+	// current token-carrier semantics.
 	PreviewTokenPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
@@ -133,7 +134,7 @@ type VMInstance struct {
 
 // PreviewPortPolicy is the VMD representation of one published port. Access
 // is empty for a Phase 1 sender and then inherits PreviewAccess. TokenVersion
-// is meaningful only for the private_token_v1 wire sentinel.
+// is meaningful only for a tokenized wire sentinel.
 type PreviewPortPolicy struct {
 	Access       string
 	TokenVersion int64
@@ -2512,16 +2513,17 @@ func normalizedPreviewAccess(access string) string {
 }
 
 // inferPreviewTokenPolicyRevision marks one incoming full snapshot as
-// tokenized only when every token sentinel carries a positive generation. The
-// policy revision itself becomes the durable watermark; there is no separate
-// control-plane wire field that an older sender could accidentally replay.
+// tokenized only when every tokenized sentinel carries a positive generation.
+// The policy revision itself becomes the durable watermark; there is no
+// separate control-plane wire field that an older sender could accidentally
+// replay.
 func inferPreviewTokenPolicyRevision(ports map[int32]PreviewPortPolicy, revision int64) int64 {
 	if revision <= 0 {
 		return 0
 	}
 	foundTokenized := false
 	for _, policy := range ports {
-		if policy.Access != preview.AccessPrivateTokenV1 {
+		if !preview.IsTokenizedAccess(policy.Access) {
 			continue
 		}
 		foundTokenized = true
@@ -2538,14 +2540,15 @@ func inferPreviewTokenPolicyRevision(ports map[int32]PreviewPortPolicy, revision
 // normalizePreviewTokenPolicy returns a detached map whose token generations
 // are usable only for an exact, current tokenized snapshot. Raw private,
 // public, legacy, and unknown modes always clear their generation. If one
-// sentinel is malformed or the sidecar watermark is stale, all generations
-// are cleared so no credential from a prior revision can be revived.
+// tokenized sentinel is malformed or the sidecar watermark is stale, all
+// generations are cleared so no credential from a prior revision can be
+// revived.
 func normalizePreviewTokenPolicy(in map[int32]PreviewPortPolicy, revision, tokenPolicyRevision int64) (map[int32]PreviewPortPolicy, int64) {
 	out := clonePreviewPorts(in)
 	foundTokenized := false
 	valid := revision > 0 && tokenPolicyRevision == revision
 	for port, policy := range out {
-		if policy.Access == preview.AccessPrivateTokenV1 {
+		if preview.IsTokenizedAccess(policy.Access) {
 			foundTokenized = true
 			if policy.TokenVersion <= 0 {
 				valid = false

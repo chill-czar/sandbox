@@ -15,9 +15,19 @@ import (
 	"github.com/google/uuid"
 )
 
-// PreviewTokenHeader carries a preview token for clients that can attach
-// request headers. Browser-oriented carriers are introduced separately.
-const PreviewTokenHeader = "X-Superserve-Preview-Token"
+// Preview token carrier names are shared by the control plane and edge proxy
+// so credential responses cannot drift from enforcement.
+const (
+	// PreviewTokenHeader carries a token for clients that can attach request
+	// headers.
+	PreviewTokenHeader = "X-Superserve-Preview-Token"
+	// PreviewTokenQueryParam bootstraps browser access. The edge exchanges a
+	// valid value for a host-only cookie and redirects to a clean URL.
+	PreviewTokenQueryParam = "superserve_preview_token"
+	// PreviewTokenCookie is the exact host-scoped browser cookie consumed by
+	// the edge. The __Host- prefix requires Secure, Path=/, and no Domain.
+	PreviewTokenCookie = "__Host-superserve_preview_token"
+)
 
 const (
 	previewTokenPrefix = "spv1"

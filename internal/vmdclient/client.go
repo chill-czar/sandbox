@@ -8,7 +8,7 @@ import (
 )
 
 // PortPolicy is the control-plane representation of one published preview
-// port. AccessPrivateTokenV1 requires a positive TokenVersion; raw private and
+// port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
 type PortPolicy struct {
 	Access       string

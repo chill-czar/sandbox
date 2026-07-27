@@ -54,6 +54,7 @@ func TestProxyHealthAdvertisesPreviewTokensOnlyWithAuthSeed(t *testing.T) {
 		preview.HostCapabilityPorts,
 		preview.HostCapabilityPortAccess,
 		preview.HostCapabilityPortTokens,
+		preview.HostCapabilityPortBrowserAuth,
 	}
 	if !reflect.DeepEqual(health.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", health.Capabilities, want)

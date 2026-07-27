@@ -20,6 +20,12 @@ const (
 	// persisted as the database access value. Older VMD/proxy generations see
 	// an unknown mode and therefore fail closed.
 	AccessPrivateTokenV1 = "private_token_v1"
+	// AccessPrivateBrowserV1 is the Phase 4 wire-only mode for private ports
+	// whose host can consume browser query/cookie carriers as well as the Phase
+	// 3 header carrier. Keeping it distinct from AccessPrivateTokenV1 makes a
+	// proxy rollback fail closed instead of silently accepting a signed link it
+	// does not know how to scrub or bootstrap.
+	AccessPrivateBrowserV1 = "private_browser_v1"
 
 	// HostCapabilityPorts is advertised by a vmd/proxy build that persists and
 	// enforces the explicit published-port allowlist.
@@ -32,6 +38,11 @@ const (
 	// seed. It is intentionally separate from per-port access so private policy
 	// cannot become active during a partial fleet rollout.
 	HostCapabilityPortTokens = "preview_port_tokens_v1"
+	// HostCapabilityPortBrowserAuth is advertised only when VMD and the live
+	// proxy understand AccessPrivateBrowserV1, including secure cookie
+	// bootstrap and complete credential scrubbing. It is additive to, and
+	// depends on, HostCapabilityPortTokens.
+	HostCapabilityPortBrowserAuth = "preview_port_browser_auth_v1"
 
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,
@@ -57,6 +68,20 @@ const (
 	// into the legacy all-port representation.
 	VMDProtocolHeader = "X-Superserve-VMD-Protocol"
 )
+
+// IsTokenizedAccess reports whether a wire-only access mode carries an exact
+// positive per-port token generation. Browser auth is an additive carrier set
+// over the Phase 3 token primitive, so both modes share the same durable
+// generation and policy watermark.
+func IsTokenizedAccess(access string) bool {
+	return access == AccessPrivateTokenV1 || access == AccessPrivateBrowserV1
+}
+
+// IsPrivateAccess reports whether a database/API private value or either
+// fail-closed wire sentinel represents an authenticated private port.
+func IsPrivateAccess(access string) bool {
+	return access == AccessPrivate || IsTokenizedAccess(access)
+}
 
 // ValidatePublishedPort rejects ports which cannot be governed by the public
 // preview allowlist.
