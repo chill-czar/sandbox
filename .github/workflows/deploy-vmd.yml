@@ -37,6 +37,11 @@ on:
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
       - 'scripts/fc-cleanup'
+      # The workflow + its deploy script must self-trigger (as deploy-otel does),
+      # or a new cell/step lands without ever running until an unrelated vmd
+      # asset changes — leaving that host on stale binaries.
+      - '.github/workflows/deploy-vmd.yml'
+      - '.github/workflows/scripts/deploy-vmd.py'
 
 jobs:
   deploy-staging:
@@ -124,31 +129,50 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # GCP_REGION keeps this fan-out on the primary region's hosts only;
-      # the usw cell host shares the project and label but deploys in the
-      # step below, after the primary succeeds.
-      - name: Discover and deploy to VMD instances
+      # The use4 cell host is the primary production host — api.superserve.ai
+      # routes there — so it deploys FIRST, before the usw secondary cell. A
+      # failure or zero-match in usw must not stop the job and leave the public
+      # host on old vmd/boxd/secretsproxy binaries. Reuses the binaries built
+      # above. Unguarded: use4 is the permanent primary, so a missing
+      # CLOUD_RUN_SERVICE_USE4/GCP_REGION_USE4 must fail the deploy rather than
+      # silently skip the only primary-host rollout. Discovery is the VMD_LABEL
+      # filter scoped to GCP_REGION_USE4 (deploy-vmd.py fails on zero matches).
+      - name: Deploy to use4 cell VMD instances
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_SERVICE: ${{ vars.VMD_SERVICE }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # use4 is the "use" cell's Supabase + control plane.
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
+          INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
         run: |
+          # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
+          # filter and fan out to every VMD_LABEL match. use4 is the permanent
+          # primary, so a missing GCP_REGION_USE4 must abort, not run unscoped.
+          : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
+          # deploy-vmd.py treats an empty CONTROL_PLANE_URL/DATABASE_URL/
+          # INTERNAL_API_TOKEN as "skip, leave the host's existing value alone" —
+          # the right behavior for staging/unprovisioned hosts, but silently
+          # deploying-and-reporting-success while these are unset on a
+          # production host is exactly the failure mode this workflow exists
+          # to prevent. Fail closed rather than skip.
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_PROD is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_PROD is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?PROD_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it
       # this way: a second job referencing the production environment would
-      # double any approval gate. Running after the primary step means a bad
-      # rollout stops at the primary, and the step reuses the binaries built
-      # above (build once, deploy per region). Skipped until
-      # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
-      # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
-      # the cell host must carry the label; zero matches fails the deploy
-      # rather than silently skipping the cell.
+      # double any approval gate. Reuses the binaries built above; skipped
+      # until CLOUD_RUN_SERVICE_USW is set. Discovery is the VMD_LABEL filter
+      # scoped to GCP_REGION_USW, so the cell host must carry the label; zero
+      # matches fails the deploy rather than silently skipping the cell.
       - name: Deploy to usw cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
@@ -159,5 +183,20 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # usw is its own cell — separate Supabase project + control plane
+          # from the "use" cell above.
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_USW }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
+          INTERNAL_API_TOKEN: ${{ secrets.PROD_USW_INTERNAL_API_TOKEN }}
         run: |
+          # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
+          # filter and fan out to every VMD_LABEL match — which would push
+          # usw's DATABASE_URL/CONTROL_PLANE_URL/INTERNAL_API_TOKEN onto the
+          # use4 primary host below instead of just skipping usw. This must
+          # abort before the fail-closed checks below, not run unscoped.
+          : "${GCP_REGION:?GCP_REGION_USW is unset — refusing an unscoped usw fan-out}"
+          # Same fail-closed reasoning as the use4 step above — see its comment.
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_USW is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_USWEST is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?PROD_USW_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py

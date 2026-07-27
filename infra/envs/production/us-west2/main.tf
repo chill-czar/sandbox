@@ -47,8 +47,11 @@ module "network" {
   create_network = var.create_network
   network_name   = var.network_name
 
-  subnet_name = "superserve-usw2-subnet"
-  subnet_cidr = var.subnet_cidr
+  subnet_name            = "superserve-usw2-subnet"
+  subnet_cidr            = var.subnet_cidr
+  manage_public_ssh_deny = true
+  enable_iap_ssh         = true
+  iap_ssh_target_tags    = ["vmd-usw2"]
 
   create_vpc_connector        = false
   create_vpc_connector_subnet = true
@@ -203,7 +206,15 @@ module "sandbox_host" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id  = local.project_id
-  environment = local.environment
-  labels      = local.common_labels
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
+  compute_instance_cpu_alerts = {
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
+    }
+  }
+  labels = local.common_labels
 }
