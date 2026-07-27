@@ -1649,6 +1649,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	var attested bool
 	var insertedSandboxID, policySandboxID uuid.UUID
 	var insertedPolicyAccess string
+	var policyInsertedAtomically bool
 	vmd := &stubVMD{
 		restorePolicyFn: func(access string, ports map[int32]struct{}, revision int64) {
 			restoredAccess, restoredPorts, restoredRevision = access, ports, revision
@@ -1669,6 +1670,13 @@ func TestCreateSandbox_Success(t *testing.T) {
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				insertedSandboxID = args[0].(uuid.UUID)
+				if strings.Contains(sql, "INSERT INTO sandbox_preview_policy") {
+					policyInsertedAtomically = true
+					policySandboxID = insertedSandboxID
+					if access, ok := args[len(args)-1].(string); ok {
+						insertedPolicyAccess = access
+					}
+				}
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
@@ -1680,11 +1688,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 			}
 			return activityRow()
 		},
-		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "-- name: CreateSandboxPreviewPolicy :exec") {
-				policySandboxID = args[0].(uuid.UUID)
-				insertedPolicyAccess = args[1].(string)
-			}
+		execFn: func(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
@@ -1714,7 +1718,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 	if !attested {
 		t.Error("create did not attest the live VMD after restore")
 	}
-	if insertedSandboxID == uuid.Nil || policySandboxID != insertedSandboxID || insertedPolicyAccess != preview.AccessPublic {
+	if insertedSandboxID == uuid.Nil || !policyInsertedAtomically || policySandboxID != insertedSandboxID || insertedPolicyAccess != preview.AccessPublic {
 		t.Errorf("inserted policy = (sandbox=%s access=%q), want sandbox=%s access=%q", policySandboxID, insertedPolicyAccess, insertedSandboxID, preview.AccessPublic)
 	}
 	// Resources should reflect what VMD reported, not the initial INSERT placeholders.
@@ -1928,6 +1932,9 @@ func newHostnameStampEnv(t *testing.T, stampErr error) *hostnameStampEnv {
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: HostHasCapability :one") {
+				return previewCapableHostRow()
+			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: e.teamID, Name: "sb",
