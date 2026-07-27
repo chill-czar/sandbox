@@ -1,6 +1,6 @@
 -- Phase 3: durable per-port token generations.
 --
--- This migration is stacked after 20260721000002_preview_port_access_policy.sql,
+-- This migration is stacked after 20260727000002_preview_port_access_policy.sql,
 -- which adds sandbox_published_port.access. Generations deliberately reference
 -- only sandbox: deleting a publication retains its generation as a tombstone,
 -- so re-publishing the same port cannot revive a previously minted token.

@@ -10,8 +10,8 @@ import (
 
 func TestPreviewTokenGenerationMigrationOrderingAndCompatibility(t *testing.T) {
 	const (
-		phase2Migration = "20260721000002_preview_port_access_policy.sql"
-		phase3Migration = "20260721000003_preview_port_token_generation.sql"
+		phase2Migration = "20260727000002_preview_port_access_policy.sql"
+		phase3Migration = "20260727000003_preview_port_token_generation.sql"
 	)
 	if phase2Migration >= phase3Migration {
 		t.Fatalf("token generation migration %q must sort after access-policy prerequisite %q", phase3Migration, phase2Migration)
@@ -65,7 +65,7 @@ func TestPreviewTokenGenerationMigrationOrderingAndCompatibility(t *testing.T) {
 }
 
 func TestPreviewTokenGenerationUsesPostConflictTriggerSemantics(t *testing.T) {
-	path := filepath.Join("..", "..", "supabase", "migrations", "20260721000003_preview_port_token_generation.sql")
+	path := filepath.Join("..", "..", "supabase", "migrations", "20260727000003_preview_port_token_generation.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
