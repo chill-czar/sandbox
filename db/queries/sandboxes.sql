@@ -6,9 +6,20 @@
 -- template_id is optional (NULL when sandbox is not derived from a template).
 -- snapshot_path / mem_path / base_path / delta_path pin the sandbox to a
 -- specific build's artifacts so a later template rebuild can't corrupt it.
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-RETURNING *;
+-- The strict preview-policy row is created in this same statement: no caller
+-- can observe a new sandbox through the rolling-deploy legacy fallback, and
+-- quota admission remains statement-sized.
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
+  RETURNING sandbox_id
+)
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplate :one
 -- CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -21,10 +32,67 @@ WITH tpl AS (
     AND t.deleted_at IS NULL
     AND (t.team_id = $14 OR t.team_id = $15)
   FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
+  RETURNING sandbox_id
 )
-INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
-SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20 FROM tpl
-RETURNING *;
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
+
+-- name: CreateSandboxWithSecrets :one
+-- CreateSandbox plus its strict preview policy and secret bindings in ONE
+-- statement. Atomicity aside, the single statement is load-bearing for quota
+-- enforcement: the insert's shard-counter admission is invisible to
+-- concurrent quota checks until it commits, and a multi-statement transaction
+-- would stretch that window across client round trips.
+WITH ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds)
+  VALUES (@id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, @template_id, @snapshot_path, @mem_path, @base_path, @delta_path, @auto_delete_seconds)
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
+
+-- name: CreateSandboxFromTemplateWithSecrets :one
+-- CreateSandboxFromTemplate plus secret bindings in one statement (see
+-- CreateSandboxWithSecrets for why the single statement matters). Returns
+-- 0 rows if the template is missing, deleted, or not visible — then no
+-- bindings are written either.
+WITH tpl AS (
+  SELECT t.id AS tpl_id, t.disk_mib FROM template t
+  WHERE t.id = @template_id
+    AND t.deleted_at IS NULL
+    AND (t.team_id = @team_id OR t.team_id = @system_team_id)
+  FOR KEY SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds)
+  SELECT @id, @team_id, @name, @status, @vcpu_count, @memory_mib, @host_id, @ip_address, @pid, @snapshot_id, @timeout_seconds, @metadata, tpl_id, @snapshot_path, @mem_path, @base_path, @delta_path, disk_mib, @auto_delete_seconds FROM tpl
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at
+FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: GetSandbox :one
 SELECT * FROM sandbox
@@ -365,10 +433,6 @@ WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
 UPDATE sandbox
 SET metadata = $2, updated_at = now()
 WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL;
-
--- name: CreateSandboxPreviewPolicy :exec
-INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
-VALUES ($1, $2, 0);
 
 -- name: GetSandboxPreviewPolicy :one
 -- An absent side-table row is the rolling-deploy-safe representation of a

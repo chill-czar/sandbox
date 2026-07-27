@@ -1026,6 +1026,7 @@ func fileExists(path string) bool {
 // ResumeVM restores a paused VM from its snapshot using a mount namespace.
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	tEntry := time.Now()
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
 	// waits, then is recognized as a retry rather than relaunching.
@@ -1112,6 +1113,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
+	tSlot := time.Now()
 	var netInfo *network.VMNetInfo
 	if inst.Namespace != "" {
 		var nsErr error
@@ -1121,10 +1123,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 	}
 
+	tFcStart := time.Now()
 	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
+	tFcDone := time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
@@ -1148,7 +1152,9 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
+	tRestore := time.Now()
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	tRestoreDone := time.Now()
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -1182,7 +1188,17 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.mu.Unlock()
 
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
+	// Resume-side phase parity with the create path's "restoring snapshot"
+	// line; wait_boxd_ms arrives async on the probe log below. prep spans
+	// the op-lock wait plus the precondition gates, so a duplicate-resume
+	// queue shows up here rather than hiding in the total.
+	log.Info().Int("pid", pid).
+		Int64("prep_ms", tSlot.Sub(tEntry).Milliseconds()).
+		Int64("ensure_slot_ms", tFcStart.Sub(tSlot).Milliseconds()).
+		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
+		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
+		Int64("total_ms", time.Since(tEntry).Milliseconds()).
+		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
 	// the vCPUs resume. Detached — status is already running and the probe
@@ -2260,12 +2276,17 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 	if m.state == nil {
 		return
 	}
+	recs, err := m.state.All()
+	if err != nil {
+		// Sweeping with an empty keep-set would delete every live VM's
+		// namespace — skip entirely when the records can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		return
+	}
 	keepNs := make(map[string]bool)
-	if recs, err := m.state.All(); err == nil {
-		for _, rec := range recs {
-			if rec.Namespace != "" {
-				keepNs[rec.Namespace] = true
-			}
+	for _, rec := range recs {
+		if rec.Namespace != "" {
+			keepNs[rec.Namespace] = true
 		}
 	}
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
@@ -2279,16 +2300,21 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 // an index a record holds. Every record is reserved unconditionally — a dead
 // record's slot is reclaimed later when the reattach cleans it up. Cheap: parses
 // slot indices, no kernel work, no systemctl.
-func (m *Manager) ReserveStartupSlots(context.Context) {
+//
+// Reports whether the reservation pass provably completed. Callers whose
+// safety depends on record slots being reserved — pool adoption treats every
+// unreserved namespace as claimable — must not proceed on false.
+func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	if m.state == nil {
-		return
+		return false
 	}
 	recs, err := m.state.All()
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
-		return
+		return false
 	}
 	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	return true
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so
@@ -3102,6 +3128,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
 func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
 	}
@@ -3119,12 +3146,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// legacy for THIS launch only; launcherReady stays with the sampler, so one
 	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
 	launcherPath := ""
-	if m.launcherReady.Load() {
-		if pin := m.launcherNSPath(); pinIsMounted(pin) {
-			launcherPath = pin
+	pin := m.launcherNSPath()
+	switch {
+	case pin == "":
+		// Launcher mode disabled: legacy is the configured path.
+	case !m.launcherReady.Load():
+		// Every launch here copies the full host mount table, so concurrent
+		// launches degrade with fleet size. launcherBuilt splits the causes:
+		// a build still in progress resolves itself; a failed build or an
+		// invalidated pin does not.
+		if m.launcherBuilt.Load() {
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin invalidated — using legacy path for this launch")
 		} else {
-			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not built — using legacy path for this launch")
 		}
+	case pinIsMounted(pin):
+		launcherPath = pin
+	default:
+		m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not mounted at launch — using legacy path for this launch")
 	}
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
@@ -3136,8 +3175,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// it needs a bigger socket budget. Decided up front: with Type=simple
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
-	// one.
+	// one. Timed separately: it is a per-launch systemd round trip, and
+	// concurrent launches serialize on the shared D-Bus connection.
+	tLinger := time.Now()
 	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
@@ -3172,6 +3214,8 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	m.log.Info().
 		Str("vm_id", vmID).
+		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
+		Int64("linger_check_ms", lingerCheckMs).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")

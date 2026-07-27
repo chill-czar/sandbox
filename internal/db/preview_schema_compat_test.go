@@ -96,6 +96,44 @@ func TestPublishPortOmissionPreservesExistingModeAndUsesTrueDefaultOnlyOnInsert(
 	}
 }
 
+func TestSandboxCreationWritesStrictPolicyInQuotaAdmissionStatement(t *testing.T) {
+	path := filepath.Join("..", "..", "db", "queries", "sandboxes.sql")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sandbox queries: %v", err)
+	}
+	queries := string(raw)
+	for _, name := range []string{
+		"CreateSandbox",
+		"CreateSandboxFromTemplate",
+		"CreateSandboxWithSecrets",
+		"CreateSandboxFromTemplateWithSecrets",
+	} {
+		marker := "-- name: " + name + " :one"
+		start := strings.Index(queries, marker)
+		if start < 0 {
+			t.Errorf("missing %s query", name)
+			continue
+		}
+		query := queries[start+len(marker):]
+		if end := strings.Index(query, "-- name: "); end >= 0 {
+			query = query[:end]
+		}
+		if !strings.Contains(query, "INSERT INTO sandbox_preview_policy") {
+			t.Errorf("%s does not create the strict preview policy atomically", name)
+		}
+		if !strings.Contains(query, "preview_access") {
+			t.Errorf("%s does not accept the new sandbox's preview access", name)
+		}
+		if !strings.Contains(query, "JOIN preview_policy") {
+			t.Errorf("%s does not require the policy insert before returning", name)
+		}
+	}
+	if strings.Contains(queries, "-- name: CreateSandboxPreviewPolicy") {
+		t.Fatal("standalone preview-policy creation would widen the quota admission transaction")
+	}
+}
+
 func TestHostCapabilityAttestationIsBoundToCurrentHeartbeat(t *testing.T) {
 	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
 	raw, err := os.ReadFile(path)
