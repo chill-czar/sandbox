@@ -252,6 +252,13 @@ func (lc *lifecycle) shutdown(ctx context.Context) {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// Hidden re-exec entry: the launcher-namespace build re-execs vmd under
+	// unshare so the detach syscalls run inside the freshly cloned
+	// namespace. Must dispatch before any daemon setup.
+	if len(os.Args) > 1 && os.Args[1] == "launcher-prune" {
+		os.Exit(vm.LauncherPruneMain())
+	}
+
 	// Structured logging with zerolog — unix timestamp, caller info enabled.
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
@@ -564,14 +571,20 @@ func main() {
 	// Reserve slots held by existing VMs (so the pool can't hand out a colliding
 	// one) and sweep leaked namespaces. The per-VM reattach runs in the background
 	// below; VMs it hasn't reached are loaded on-demand on first request.
-	mgr.ReserveStartupSlots(ctx)
-	mgr.SweepStartupOrphanNamespaces()
+	slotsReserved := mgr.ReserveStartupSlots(ctx)
+	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
+	if !adoptNetPool {
+		// Under adoption, orphan namespaces are warm-pool candidates instead
+		// of garbage; the adoption pass below validates or sweeps each one.
+		mgr.SweepStartupOrphanNamespaces()
+	}
 
 	// Launcher launch path, enabled per host via VMD_LAUNCH_VIA_LAUNCHER_NS.
 	if launchViaLauncherNS {
-		// Build the pruned launcher mount namespace in the background: the prune is
-		// O(fleet) (up to launcherBuildTimeout), and launches fall back to legacy
-		// until the pin is ready, so boot and the warm pool aren't held behind it.
+		// Build the pruned launcher mount namespace in the background. The batched
+		// prune normally takes seconds, but a wedged mount syscall can hold it for
+		// up to launcherBuildTimeout — boot and the warm pool must not be held
+		// behind that; launches fall back to legacy until the pin is ready.
 		go func() {
 			defer sentrylog.Recover("launcher namespace build")
 			if err := mgr.EnsureLauncherNamespace(ctx); err != nil {
@@ -592,8 +605,24 @@ func main() {
 		NewSize:           netPoolFresh,
 		RecycleSize:       netPoolRecycle,
 		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:     adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
+	switch {
+	case adoptNetPool && slotsReserved:
+		// Adopt the slots the previous run abandoned (or crashed out of) in
+		// the background: the pool starts warm within seconds instead of
+		// refilling from scratch, and boot never blocks on the pass.
+		go func() {
+			defer sentrylog.Recover("netpool adoption")
+			netPool.AdoptOrphanSlots(ctx)
+		}()
+	case adoptNetPool:
+		// Without a completed reservation pass, adoption cannot tell live VM
+		// namespaces from orphans — leave everything in place; the pool
+		// refills fresh and the next healthy boot adopts.
+		log.Error().Msg("skipping network pool adoption: startup slot reservation did not complete")
+	}
 
 	// Leak gauge for network namespaces — independent of the launcher path, and
 	// started after StartPool so its first read observes an initialized pool.
@@ -662,6 +691,7 @@ func main() {
 				ControlPlaneURL: cfg.ControlPlaneURL,
 				HostID:          cfg.HostID,
 				Token:           os.Getenv("INTERNAL_API_TOKEN"),
+				ProxyHealthURL:  os.Getenv("PROXY_HEALTH_URL"),
 			}, log)
 			return nil
 		})

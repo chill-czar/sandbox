@@ -27,6 +27,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/authz"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/secrets"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
@@ -93,12 +94,14 @@ type Handlers struct {
 	authzSvc  *authz.Service
 }
 
-// asyncBookkeeping runs a fire-and-forget post-VMD bookkeeping DB write in a
-// background goroutine. These writes are off the hot path by design: the gate
-// write (BeginPause/BeginResume/create INSERT) already owns the row, and every
-// subsequent transition is status-gated, so nothing can proceed until the
-// bookkeeping lands — a racing request just sees the transitional status and
-// 409s until the write commits.
+// asyncBookkeeping runs fire-and-forget post-VMD work in a background
+// goroutine — bookkeeping DB writes, and the create path's hostname stamp.
+// This is off the hot path by design: the gate write (BeginPause/BeginResume/
+// create INSERT) already owns the row, and every subsequent transition is
+// status-gated, so nothing can proceed until the job lands — a racing request
+// just sees the transitional status and 409s until it commits. Work that
+// needs that protection must therefore run BEFORE the status flip inside the
+// same job, the way the create path orders its stamp before ActivateSandbox.
 func (h *Handlers) asyncBookkeeping(name string, fn func()) {
 	h.asyncMu.Lock()
 	h.asyncCount++
@@ -190,6 +193,36 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // vmdTimeout is the default deadline for VMD gRPC calls.
 const vmdTimeout = 30 * time.Second
 
+// retryTransientBoot runs one vmd boot call under vmdTimeout and, when the
+// attempt dies on a transient — DeadlineExceeded, or Unavailable that
+// outlived the dial-site interceptor's window — with the caller's context
+// still alive, runs exactly one more under a fresh vmdTimeout; worst case
+// 2×vmdTimeout for a caller that waits, which stays under Cloud Run's 300s
+// request timeout (the real ceiling; a serverless backend has no LB-level
+// timeout). The daemon serializes same-ID boots and
+// recognizes a completed prior attempt, so the retry either adopts the VM
+// the first attempt brought up or boots cleanly — never a double boot; at
+// most one retry per boot and the daemon's restore semaphore bound the
+// added load. A dead caller skips the retry: a boot landing after the
+// client gave up would activate a sandbox the caller believes failed.
+// (pauseWithRetry deliberately differs on both points — any-error retry,
+// detached context — because a late pause reconciles state instead of
+// surprising the caller.)
+func retryTransientBoot(parent context.Context, sandboxID string, boot func(context.Context) (string, uint32, uint32, error)) (ip string, vcpu, memMiB uint32, retried bool, err error) {
+	attempt := func() (string, uint32, uint32, error) {
+		ctx, cancel := context.WithTimeout(parent, vmdTimeout)
+		defer cancel()
+		return boot(ctx)
+	}
+	ip, vcpu, memMiB, err = attempt()
+	if err == nil || !(isVMDDeadline(err) || isVMDUnavailable(err)) || parent.Err() != nil {
+		return ip, vcpu, memMiB, false, err
+	}
+	log.Warn().Str("sandbox_id", sandboxID).Msg("vmd boot hit a transient — retrying once")
+	ip, vcpu, memMiB, err = attempt()
+	return ip, vcpu, memMiB, true, err
+}
+
 // asyncTimeout is the deadline for fire-and-forget DB writes.
 const asyncTimeout = 5 * time.Second
 
@@ -198,9 +231,12 @@ const asyncTimeout = 5 * time.Second
 // starting/resuming→active flip commits, so the owner's immediate follow-up
 // (create then exec — the canonical SDK flow) may read the pre-flip status;
 // waiting briefly preserves read-your-writes instead of 409ing it. Normally
-// the write lands in single-digit ms; a genuinely lost write still 409s once
-// the window expires. Var, not const, so tests can shrink it.
-var activateSettleWindow = 2 * time.Second
+// the write lands in single-digit ms, but a hostname-only create's stamp runs
+// before the flip and its guest round trip is bounded by the boxd client's
+// timeout — the window must outlast that bound, or a slow-but-alive guest
+// turns the canonical follow-up into a 409. A genuinely lost write still 409s
+// once the window expires. Var, not const, so tests can shrink it.
+var activateSettleWindow = 6 * time.Second
 
 // activateSettlePoll is the re-read interval within activateSettleWindow.
 const activateSettlePoll = 50 * time.Millisecond
@@ -467,6 +503,20 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
+	// Resolve the effective policy before claiming the sandbox. A missing
+	// side-table row is an older control plane's legacy sandbox; strict
+	// sandboxes may only resume while their host proves enforcement support.
+	// The snapshot is also the fallback payload if VMD lost its in-memory VM.
+	resumePolicy, err := h.loadPreviewPolicySnapshot(c.Request.Context(), sandboxID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load preview policy for resume failed")
+		respondError(c, ErrInternal)
+		return false
+	}
+	if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		return false
+	}
+
 	// Serialize the paused→resuming claim with attach/detach via a DB advisory
 	// lock (held only for the claim). Both take the same lock and re-read status
 	// under it, so across API instances a mutation can't read a stale 'paused' and
@@ -482,7 +532,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	}
 	var (
 		claimed db.Sandbox
-		err     error
 	)
 	if h.Pool == nil {
 		claimed, err = claimResume(h.DB)
@@ -563,12 +612,19 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return false
 	}
 
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
 	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
 	// tokens as they were at pause; the current binding set is re-applied below
 	// once the VM is up, so a mutation made while paused takes effect.
-	ipAddress, actualVcpu, actualMemMiB, err := vmd.ResumeInstance(vmdCtx, sandboxID.String(), snapshotPath, memPath)
+	//
+	// One clock for the whole boot sequence: ResumeInstance, its deadline
+	// retry, and the stateless fallback all draw down the same 2×vmdTimeout
+	// budget, so a resume holds the row mid-transition for a bounded window
+	// no matter which path it walks.
+	bootCtx, bootCancel := context.WithTimeout(c.Request.Context(), 2*vmdTimeout)
+	defer bootCancel()
+	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		return vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath)
+	})
 	if err != nil {
 		if isVMDNotFound(err) {
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).
@@ -576,15 +632,24 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// RestoreSnapshot takes an optional envVars map; we pass nil here
 			// because resume is supposed to preserve whatever envs the sandbox
 			// already has baked into the snapshot — not inject new ones.
-			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), nil)
+			// Single attempt under whatever remains of the sequence budget:
+			// the fallback is already the second recovery layer.
+			fctx, fcancel := context.WithTimeout(bootCtx, vmdTimeout)
+			ipAddress, actualVcpu, actualMemMiB, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumePolicy.Access, resumePolicy.Ports, resumePolicy.Revision, nil)
+			fcancel()
 			if err != nil {
 				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD RestoreSnapshot fallback failed")
+				// Deliberately no destroy for a boot that may land late: the
+				// row reverts to paused, so a follow-up resume on this ID
+				// adopts the live VM (instant resume), and the reconciler
+				// reaps the paused-row/active-VM state if no retry comes.
 				revertToPaused()
 				respondError(c, ErrInternal)
 				return false
 			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
+			// Same deliberate no-destroy as the fallback branch above.
 			revertToPaused()
 			respondError(c, ErrInternal)
 			return false
@@ -645,6 +710,31 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// flip — the reconciler is the backstop.
 			log.Error().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("resume revert: FinalizePause failed, best-effort revert to paused")
 			revertToPaused()
+		}
+	}
+
+	// Re-read and push after the VM is present. A publication mutation can race
+	// the stateless restore while VMD returns NotFound to the mutation push; this
+	// final authoritative snapshot closes that window. If a later mutation wins,
+	// VMD's monotonic revision check rejects this older snapshot.
+	currentPolicy, policyErr := h.loadPreviewPolicySnapshot(postCtx, sandboxID, teamID)
+	if policyErr != nil {
+		log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reload preview policy after resume failed")
+		pauseAndRevert()
+		respondError(c, ErrInternal)
+		return false
+	}
+	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.Access, currentPolicy.Ports, currentPolicy.Revision); policyErr != nil {
+		if currentPolicy.Access == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
+			// Legacy sandboxes remain compatible with a VMD from before policy
+			// updates existed. Strict resumes were capability-gated above and may
+			// never take this fallback.
+			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks preview policy update for legacy resume")
+		} else {
+			log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reapply preview policy after resume failed")
+			pauseAndRevert()
+			respondError(c, ErrInternal)
+			return false
 		}
 	}
 
@@ -860,7 +950,15 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	c.JSON(http.StatusOK, h.sandboxToResponseWithToken(*sandbox))
+	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandbox.ID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	resp := h.sandboxToResponseWithToken(*sandbox)
+	resp.PreviewAccess = policy.Access
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *Handlers) ResumeSandbox(c *gin.Context) {
@@ -1169,6 +1267,10 @@ type createSandboxRequest struct {
 	// Secrets binds team-stored credentials to env-var names; the agent sees a
 	// per-binding proxy token, swapped for the real value at egress.
 	Secrets map[string]string `json:"secrets,omitempty"`
+
+	// PreviewAccess is currently only "public": new sandboxes default to the
+	// strict explicitly-published-port model. legacy_public is migration-only.
+	PreviewAccess *string `json:"preview_access,omitempty"`
 }
 
 type sandboxResponse struct {
@@ -1187,10 +1289,11 @@ type sandboxResponse struct {
 	// AutoDeleteAt is the concrete deletion deadline. Present only while the
 	// sandbox is paused with an auto-delete window configured, so clients can
 	// see exactly when the sandbox will be removed.
-	AutoDeleteAt *time.Time             `json:"auto_delete_at,omitempty"`
-	Network      *networkConfigRequest  `json:"network,omitempty"`
-	Metadata     map[string]string      `json:"metadata"`
-	Secrets      []sandboxSecretBinding `json:"secrets,omitempty"`
+	AutoDeleteAt  *time.Time             `json:"auto_delete_at,omitempty"`
+	Network       *networkConfigRequest  `json:"network,omitempty"`
+	Metadata      map[string]string      `json:"metadata"`
+	Secrets       []sandboxSecretBinding `json:"secrets,omitempty"`
+	PreviewAccess string                 `json:"preview_access"`
 }
 
 // sandboxSecretBinding mirrors one (env_key → secret) binding on a sandbox.
@@ -1211,6 +1314,9 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 		MemoryMib: s.MemoryMib,
 		CreatedAt: s.CreatedAt,
 		Metadata:  decodeMetadata(s.Metadata),
+		// No side-table row means the sandbox came from an older control plane.
+		// Callers that load policy data overwrite this legacy-safe default.
+		PreviewAccess: preview.AccessLegacyPublic,
 	}
 	if s.SnapshotID.Valid {
 		id := uuid.UUID(s.SnapshotID.Bytes)
@@ -1381,10 +1487,23 @@ func (h *Handlers) ListSandboxes(c *gin.Context) {
 		return
 	}
 	c.Header("X-Total-Count", strconv.FormatInt(total, 10))
+	policies, err := h.DB.ListSandboxPreviewPoliciesByTeam(ctx, teamID)
+	if err != nil {
+		log.Error().Err(err).Msg("DB ListSandboxPreviewPoliciesByTeam failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	previewAccessBySandbox := make(map[uuid.UUID]string, len(policies))
+	for _, policy := range policies {
+		previewAccessBySandbox[policy.SandboxID] = policy.Access
+	}
 
 	out := make([]sandboxResponse, len(sandboxes))
 	for i, s := range sandboxes {
 		out[i] = h.sandboxToResponse(s)
+		if access, ok := previewAccessBySandbox[s.ID]; ok {
+			out[i].PreviewAccess = access
+		}
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -1451,6 +1570,13 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 	}
 
 	resp := h.sandboxToResponse(sandbox)
+	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	resp.PreviewAccess = policy.Access
 	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
 	if permErr != nil {
 		log.Error().
@@ -1460,6 +1586,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
+		resp.PreviewAccess = policy.Access
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -1529,6 +1656,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	if err := validateEnvVars(req.EnvVars); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validatePreviewAccess(req.PreviewAccess); err != nil {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1644,6 +1775,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	SetTelemetryHostID(c, hostID)
 
+	// Every new sandbox starts strict, so it can only be placed on a host that
+	// advertises publication enforcement. This happens before DB/VM creation.
+	if !h.requireHostPreviewPorts(c, hostID) {
+		return
+	}
+
 	// Resolve the VMD client up front so we don't waste a DB INSERT on
 	// a host we can't reach.
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), hostID)
@@ -1665,7 +1802,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		err     error
 	}
 	insertCh := make(chan insertResult, 1)
-	// runInsert performs the INSERT against the supplied tx-bound queries.
+	// runInsert performs the quota-safe sandbox + preview-policy statement.
 	// Closure captures sandboxID/teamID/req/templateID/hostID/metadataJSON.
 	runInsert := func(q *db.Queries) (db.Sandbox, error) {
 		if templateID.Valid {
@@ -1674,7 +1811,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// so a concurrent template delete is either blocked (we win,
 			// INSERT succeeds) or completes before us (we lose, 0 rows back).
 			// Pin artifact paths so a later rebuild can't shift them.
-			return q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
+			row, err := q.CreateSandboxFromTemplate(insertCtx, db.CreateSandboxFromTemplateParams{
 				ID:                sandboxID,
 				TeamID:            teamID,
 				Name:              req.Name,
@@ -1692,9 +1829,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				MemPath:           nullableStr(snapshotMemPath),
 				BasePath:          nullableStr(basePath),
 				DeltaPath:         nullableStr(deltaPath),
+				PreviewAccess:     preview.AccessPublic,
 			})
+			return db.Sandbox(row), err
 		}
-		return q.CreateSandbox(insertCtx, db.CreateSandboxParams{
+		row, err := q.CreateSandbox(insertCtx, db.CreateSandboxParams{
 			ID:                sandboxID,
 			TeamID:            teamID,
 			Name:              req.Name,
@@ -1710,56 +1849,70 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			MemPath:           nil,
 			BasePath:          nil,
 			DeltaPath:         nil,
+			PreviewAccess:     preview.AccessPublic,
 		})
+		return db.Sandbox(row), err
 	}
-	// insertWithBindings writes the sandbox row, and its secret bindings in the
-	// same transaction when any are attached, so a successful create never leaves
-	// a binding unrecorded. With no secrets it is a plain insert — no transaction.
+	// insertWithBindings writes the sandbox row, its strict preview policy, and
+	// any secret bindings in one statement. That keeps the legacy-public
+	// fallback unobservable for new sandboxes and leaves the quota admission's
+	// uncommitted window statement-sized (see the query comments).
 	insertWithBindings := func() (db.Sandbox, error) {
 		if len(secretBindings) == 0 {
 			return runInsert(h.DB)
 		}
-		runBoth := func(q *db.Queries) (db.Sandbox, error) {
-			sb, err := runInsert(q)
-			if err != nil {
-				return db.Sandbox{}, err
-			}
-			secretIDs := make([]uuid.UUID, len(secretBindings))
-			envKeys := make([]string, len(secretBindings))
-			proxyTokens := make([]string, len(secretBindings))
-			for i := range secretBindings {
-				secretIDs[i] = secretBindings[i].SecretID
-				envKeys[i] = secretBindings[i].EnvKey
-				// secretMeta is index-aligned with secretBindings; persist its token.
-				proxyTokens[i] = secretMeta[i].ProxyToken
-			}
-			if err := q.AddSandboxSecrets(insertCtx, db.AddSandboxSecretsParams{
-				SandboxID:   sandboxID,
-				SecretIds:   secretIDs,
-				EnvKeys:     envKeys,
-				ProxyTokens: proxyTokens,
-			}); err != nil {
-				return db.Sandbox{}, fmt.Errorf("insert secret bindings: %w", err)
-			}
-			return sb, nil
+		secretIDs := make([]uuid.UUID, len(secretBindings))
+		envKeys := make([]string, len(secretBindings))
+		proxyTokens := make([]string, len(secretBindings))
+		for i := range secretBindings {
+			secretIDs[i] = secretBindings[i].SecretID
+			envKeys[i] = secretBindings[i].EnvKey
+			// secretMeta is index-aligned with secretBindings; persist its token.
+			proxyTokens[i] = secretMeta[i].ProxyToken
 		}
-		// No pool (DBTX-mocked unit tests): fall back to a direct insert.
-		if h.Pool == nil {
-			return runBoth(h.DB)
+		if templateID.Valid {
+			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
+				TemplateID:        uuid.UUID(templateID.Bytes),
+				TeamID:            teamID,
+				SystemTeamID:      h.systemTeamID(),
+				ID:                sandboxID,
+				Name:              req.Name,
+				Status:            db.SandboxStatusStarting,
+				VcpuCount:         1, // placeholders; real values land via ActivateSandbox
+				MemoryMib:         1,
+				HostID:            hostID,
+				TimeoutSeconds:    req.TimeoutSeconds,
+				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				Metadata:          metadataJSON,
+				SnapshotPath:      nullableStr(snapshotPath),
+				MemPath:           nullableStr(snapshotMemPath),
+				BasePath:          nullableStr(basePath),
+				DeltaPath:         nullableStr(deltaPath),
+				PreviewAccess:     preview.AccessPublic,
+				SecretIds:         secretIDs,
+				EnvKeys:           envKeys,
+				ProxyTokens:       proxyTokens,
+			})
+			return db.Sandbox(row), err
 		}
-		tx, err := h.Pool.Begin(insertCtx)
-		if err != nil {
-			return db.Sandbox{}, err
-		}
-		defer tx.Rollback(insertCtx)
-		sb, err := runBoth(h.DB.WithTx(tx))
-		if err != nil {
-			return db.Sandbox{}, err
-		}
-		if err := tx.Commit(insertCtx); err != nil {
-			return db.Sandbox{}, err
-		}
-		return sb, nil
+		row, err := h.DB.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
+			ID:                sandboxID,
+			TeamID:            teamID,
+			Name:              req.Name,
+			Status:            db.SandboxStatusStarting,
+			VcpuCount:         1,
+			MemoryMib:         1,
+			HostID:            hostID,
+			TimeoutSeconds:    req.TimeoutSeconds,
+			AutoDeleteSeconds: req.AutoDeleteSeconds,
+			Metadata:          metadataJSON,
+			TemplateID:        pgtype.UUID{Valid: false},
+			PreviewAccess:     preview.AccessPublic,
+			SecretIds:         secretIDs,
+			EnvKeys:           envKeys,
+			ProxyTokens:       proxyTokens,
+		})
+		return db.Sandbox(row), err
 	}
 
 	var tInsertStart, tInsertEnd time.Time
@@ -1772,12 +1925,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}()
 
 	// Boot the VM synchronously — the client gets a response only after
-	// the sandbox is fully running and ready to use. This call is still
-	// scoped to the request context so that if the client hangs up, the
-	// boot is cancelled and VMD cleans up.
-	vmdCtx, vmdCancel := context.WithTimeout(c.Request.Context(), vmdTimeout)
-	defer vmdCancel()
-
+	// the sandbox is fully running and ready to use. The boot is still
+	// scoped to the request context so that if the client hangs up, it is
+	// cancelled and VMD cleans up.
 	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
 
 	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
@@ -1785,7 +1935,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// InjectSandboxEnv pushes the env again together with the JWT minted
 	// against the now-known source IP.
 	tVmdStart := time.Now()
-	ipAddress, actualVcpu, actualMemMiB, vmdErr := vmd.RestoreSnapshot(vmdCtx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), req.EnvVars)
+	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), func(ctx context.Context) (string, uint32, uint32, error) {
+		return vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), preview.AccessPublic, nil, 0, req.EnvVars)
+	})
 	tVmdEnd := time.Now()
 
 	// Wait for the parallel INSERT to complete — its result determines
@@ -1839,6 +1991,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// records the create failure metric from the HTTP status, so avoid
 		// emitting a second request-scoped transition here.
 		log.Error().Err(vmdErr).Str("sandbox_id", sandbox.ID.String()).Msg("VMD create/resume failed")
+		// A cancelled attempt can still complete on the host just after the
+		// deadline; best-effort destroy so a booted VM can't idle against a
+		// failed row until the reconciler sweeps it.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+		cleanupCancel()
 		failCtx, failCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
 		defer failCancel()
 		if err := h.DB.UpdateSandboxStatus(failCtx, db.UpdateSandboxStatusParams{
@@ -1864,9 +2022,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Phase 2: with the source IP known, mint the per-sandbox secrets JWT
 	// (when secrets are configured) and push env vars to the running boxd.
 	// If injection fails, tear the VM down and mark the row failed — a
-	// sandbox that boots without its env vars is unusable.
+	// sandbox that boots without its env vars is unusable. (Hostname-only
+	// creates run the same call inside the activation goroutine instead;
+	// a failure there fails the row before it ever goes active.)
 	postCtx, postCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
 	defer postCancel()
+
+	// Re-attest the live VMD after RestoreSnapshot. The host capability was
+	// checked before boot, but VMD can roll back in that window; an older VMD
+	// ignores the additive RestoreSnapshot policy fields and would otherwise
+	// create a legacy/all-port VM. The new RPC is deliberately required even
+	// for initial revision zero. Do this before env injection or any 201-visible
+	// side effects so failure tears the VM down without exposing it.
+	if err := vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), preview.AccessPublic, nil, 0); err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD preview policy attestation failed after restore")
+		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+		respondError(c, ErrInternal)
+		return
+	}
 
 	// Persist egress rules before injecting the env, so the secrets proxy's live
 	// rule fetch sees them before the agent can issue a proxied request. The
@@ -1893,16 +2066,26 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		secretsJWT = jwt
 	}
-	if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
-		// A vmd without this RPC already applied these env vars during
-		// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
-		if secretsJWT == "" && isVMDUnimplemented(injErr) {
-			log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
-		} else {
-			log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
-			h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
-			respondError(c, ErrInternal)
-			return
+	// When the inject would carry nothing but the hostname stamp (the payload
+	// is exactly env vars + JWT + hostname — a new always-shipped field must
+	// join this condition), it moves off the response path: the stamp runs in
+	// the activation goroutine below, ordered before the status flip.
+	// The deeper form — vmd stamping the hostname itself during
+	// RestoreSnapshot, where the round trip is on-host — would remove this
+	// branch entirely; it needs a cross-version vmd rollout to adopt.
+	stampAsync := len(envVarsToShip) == 0 && secretsJWT == ""
+	if !stampAsync {
+		if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+			// A vmd without this RPC already applied these env vars during
+			// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
+			if secretsJWT == "" && isVMDUnimplemented(injErr) {
+				log.Warn().Str("sandbox_id", sandboxID.String()).Msg("vmd lacks InjectSandboxEnv; env applied during restore")
+			} else {
+				log.Error().Err(injErr).Str("sandbox_id", sandboxID.String()).Msg("VMD InjectSandboxEnv failed")
+				h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				respondError(c, ErrInternal)
+				return
+			}
 		}
 	}
 
@@ -1955,6 +2138,38 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	actorID := actorIDFromContext(c)
 	activateCtx := context.WithoutCancel(c.Request.Context())
 	h.asyncBookkeeping("activate-sandbox", func() {
+		if stampAsync {
+			// The hostname stamp runs here, BEFORE the row goes active:
+			// pause and destroy are status-gated on 'active', so this
+			// ordering keeps the sync path's invariant that nothing can
+			// freeze or tear down a guest mid-stamp — and a snapshot can
+			// never capture the template hostname, which matters because
+			// the stateless-resume fallback never re-stamps. The deadline
+			// matches the sync path's budget.
+			sctx, scancel := context.WithTimeout(activateCtx, vmdTimeout)
+			tStamp := time.Now()
+			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), envVarsToShip, secretsJWT)
+			scancel()
+			switch {
+			case stampErr == nil, isVMDUnimplemented(stampErr):
+			default:
+				// The stamp's payload is cosmetic but its transport is not:
+				// a POST into the guest just failed — the same signal the
+				// synchronous path treats as an unusable sandbox. Fail the
+				// row instead of activating a sandbox whose guest is dead.
+				// NotFound lands here too: destroy is gated on 'active', so
+				// pre-activation the VM can only be gone abnormally — and
+				// ActivateSandbox has no status guard, so proceeding could
+				// resurrect a row another path just marked failed.
+				log.Error().Err(stampErr).Str("sandbox_id", sandboxID.String()).
+					Int64("stamp_ms", time.Since(tStamp).Milliseconds()).
+					Msg("post-boot guest init failed; failing sandbox instead of activating")
+				fctx, fcancel := context.WithTimeout(activateCtx, vmdTimeout)
+				defer fcancel()
+				h.failSandboxAfterBoot(fctx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+				return
+			}
+		}
 		actx, acancel := context.WithTimeout(activateCtx, asyncTimeout)
 		defer acancel()
 		if err := h.DB.ActivateSandbox(actx, db.ActivateSandboxParams{
@@ -1997,6 +2212,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	sandbox.Status = db.SandboxStatusActive
 	resp := h.sandboxToResponseWithToken(sandbox)
+	resp.PreviewAccess = preview.AccessPublic
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		resp.Network = req.Network
 	}
@@ -2006,6 +2222,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		Int64("lookup_ms", tLookupDone.Sub(tStart).Milliseconds()).
 		Int64("sched_ms", tVmdStart.Sub(tLookupDone).Milliseconds()).
 		Int64("vmd_ms", tVmdEnd.Sub(tVmdStart).Milliseconds()).
+		Bool("vmd_retried", vmdRetried).
 		Int64("insert_ms", tInsertEnd.Sub(tInsertStart).Milliseconds()).
 		Int64("insert_wait_after_vmd_ms", tInsertReceive.Sub(tVmdEnd).Milliseconds()).
 		Int64("post_ms", tPostDone.Sub(tInsertReceive).Milliseconds()).
@@ -2295,6 +2512,7 @@ type patchSandboxRequest struct {
 	Metadata          map[string]string     `json:"metadata,omitempty"`
 	AutoDeleteSeconds optionalInt32         `json:"auto_delete_seconds,omitempty"`
 	TimeoutSeconds    optionalInt32         `json:"timeout_seconds,omitempty"`
+	PreviewAccess     *string               `json:"preview_access,omitempty"`
 }
 
 // optionalInt32 is a tri-state JSON field: absent (Set=false), explicit null
@@ -2343,8 +2561,12 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	// Reject empty patches.
-	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set {
-		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds)", http.StatusBadRequest)
+	if body.Network == nil && body.Metadata == nil && !body.AutoDeleteSeconds.Set && !body.TimeoutSeconds.Set && body.PreviewAccess == nil {
+		respondErrorMsg(c, "bad_request", "patch body must include at least one field (network, metadata, auto_delete_seconds, timeout_seconds, preview_access)", http.StatusBadRequest)
+		return
+	}
+	if err := validatePreviewAccess(body.PreviewAccess); err != nil {
+		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -2500,7 +2722,41 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 		}
 	}
 
+	if body.PreviewAccess != nil {
+		if !h.applyPreviewAccessPatch(c, sandbox, teamID) {
+			return
+		}
+	}
+
 	c.Status(http.StatusNoContent)
+}
+
+func (h *Handlers) applyPreviewAccessPatch(c *gin.Context, sandbox db.Sandbox, teamID uuid.UUID) bool {
+	if !h.requireHostPreviewPorts(c, sandbox.HostID) {
+		return false
+	}
+	var updated int64
+	policy, err := h.applyPreviewMutation(c.Request.Context(), sandbox.ID, teamID, func(q *db.Queries) error {
+		var mutationErr error
+		updated, mutationErr = q.UpdateSandboxPreviewAccess(c.Request.Context(), db.UpdateSandboxPreviewAccessParams{
+			SandboxID: sandbox.ID, Access: preview.AccessPublic, TeamID: teamID,
+		})
+		return mutationErr
+	})
+	if err != nil {
+		return h.handlePreviewMutationResult(c, sandbox.ID, "UpdateSandboxPreviewAccess", err)
+	}
+	if updated == 0 {
+		respondError(c, ErrSandboxNotFound)
+		return false
+	}
+	if !h.pushAfterPreviewMutation(c, sandbox, policy) {
+		return false
+	}
+	detail, _ := json.Marshal(map[string]string{"preview_access": preview.AccessPublic})
+	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorIDFromContext(c), "sandbox", "preview_access_updated", "success", &sandbox.Name, nil, detail)
+	h.capture(c, "sandbox_preview_access_updated", map[string]any{"sandbox_id": sandbox.ID.String(), "preview_access": preview.AccessPublic})
+	return true
 }
 
 // applyRowsAffectedPatch runs a rows-affected sandbox update and maps the

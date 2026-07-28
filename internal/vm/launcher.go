@@ -14,20 +14,43 @@ import (
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
-// launcherPruneScript strips every /run/netns nsfs mount from a freshly cloned
-// namespace. A single `umount /run/netns` detaches only the parent layer; the
-// per-netns nsfs mounts remain stacked on /run/netns/ns-N, so we unmount each.
-// make-rprivate MUST run first (|| exit 1) to sever propagation from the host —
-// without it a umount could propagate back and detach the host's live pins.
-const launcherPruneScript = `mount --make-rprivate / || exit 1
-umount -l /run/netns 2>/dev/null || true
-for m in $(grep ' /run/netns/' /proc/self/mounts | awk '{print $2}'); do umount -l "$m" 2>/dev/null || true; done`
+// launcherPruneArg is the hidden argv[1] under which vmd re-execs itself to
+// run the prune inside the freshly cloned namespace (see LauncherPruneMain).
+// A re-exec, not a shell: the umount binary re-reads the mount table per
+// target, which makes a script prune quadratic in table size — raw
+// MNT_DETACH syscalls keep the build linear at any fleet size.
+const launcherPruneArg = "launcher-prune"
+
+// launcherPruneEnv is the spawn marker the build sets on the re-exec child;
+// LauncherPruneMain refuses to run without it. Together with the child's own
+// namespace check it keeps a direct invocation — in any mount namespace —
+// from detaching live netns pins.
+const launcherPruneEnv = "VMD_LAUNCHER_PRUNE_CHILD"
+
+// prunePaths returns every /run/netns pin mountpoint from /proc/self/mounts
+// content, in file order. Stacked pins list one line per layer and each
+// MNT_DETACH peels the topmost, so duplicates must be kept, not deduped.
+// Mountpoints are kernel-escaped (\040 etc.); unescape so the unmount
+// targets the real path even for netns names vmd didn't create.
+func prunePaths(mounts []byte) []string {
+	var paths []string
+	for _, line := range strings.Split(string(mounts), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if mp := unescapeMountinfo(f[1]); strings.HasPrefix(mp, "/run/netns/") {
+			paths = append(paths, mp)
+		}
+	}
+	return paths
+}
 
 // launcherBuildTimeout reaps a genuinely wedged mount syscall — it does not
-// pace the build, which runs async with legacy-path fallback until done, so a
-// slow build costs nothing. The prune is O(host mount table), so the bound
-// must stay comfortably ahead of fleet growth: a bound the prune catches up
-// to silently strands the host on the legacy launch path.
+// pace the build, which runs async with legacy-path fallback until done. The
+// syscall prune is sub-second even at fleet scale, so the bound exists only
+// to reap a wedge; do not raise it to accommodate growth, as it also bounds
+// how long a wedged build delays the boot-time error.
 const launcherBuildTimeout = 10 * time.Minute
 
 // EnsureLauncherNamespace builds and pins the pruned launcher mount namespace at
@@ -118,7 +141,15 @@ func buildLauncherNamespace(ctx context.Context, pinPath string) error {
 	if err := ensurePinFile(pinPath); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", "sh", "-c", launcherPruneScript)
+	// The daemon's pid-qualified exe link, resolved by unshare's exec: bare
+	// /proc/self/exe would name unshare's own binary at that point, and the
+	// on-disk vmd path can be a different (just-deployed) binary — this link
+	// execs the running daemon's inode either way.
+	pruner := fmt.Sprintf("/proc/%d/exe", os.Getpid())
+	cmd := exec.CommandContext(ctx, "unshare", "--mount="+pinPath, "--", pruner, launcherPruneArg)
+	// Positive spawn marker required by LauncherPruneMain, so an accidental
+	// direct `vmd launcher-prune` refuses even outside the init namespace.
+	cmd.Env = append(os.Environ(), launcherPruneEnv+"=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("unshare --mount=%s: %v: %s", pinPath, err, strings.TrimSpace(string(out)))
 	}
@@ -237,11 +268,15 @@ func (m *Manager) startSampler(ctx context.Context, name string, every time.Dura
 
 // StartMountCountSampler periodically logs the host mount-table size so the
 // O(1)-launch invariant — mount count should stay roughly flat, not grow with
-// the fleet — is observable in the log pipeline. One /proc/mounts read per tick.
+// the fleet — is observable in the log pipeline. launcher_ready rides along as
+// the alertable series for launches degrading to the legacy full-table path;
+// the per-launch warns carry the vm_id detail but make a poor time series.
+// One /proc/mounts read per tick.
 func (m *Manager) StartMountCountSampler(ctx context.Context, every time.Duration) {
 	m.startSampler(ctx, "mount-count sampler", every, func() {
 		total, nsfs := hostMountCounts()
 		m.log.Info().Int("host_mount_count", total).Int("host_nsfs_count", nsfs).
+			Bool("launcher_ready", m.launcherReady.Load()).
 			Msg("host mount table")
 		m.revalidateLauncher(ctx)
 	})

@@ -26,6 +26,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/presence"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/shellquote"
 	pb "github.com/superserve-ai/sandbox/proto/boxdpb"
@@ -103,6 +104,13 @@ type VMInstance struct {
 	Metadata     map[string]string
 	TeamID       string // owning team; carried for data-plane usage attribution
 	OwnerID      string // creating user; empty when unknown
+
+	// PreviewAccess and PreviewPorts are the data-plane publication policy.
+	// Empty/legacy_public preserves historical all-port routing; public requires
+	// membership in the allowlist. The revision rejects stale full-set pushes.
+	PreviewAccess         string
+	PreviewPorts          map[int32]struct{}
+	PreviewPolicyRevision int64
 
 	// BaseMemPath is the immutable base (template) memory file for a layered
 	// snapshot. Set at create-from-template; non-empty ⇒ this VM's pauses write a
@@ -1005,6 +1013,7 @@ func fileExists(path string) bool {
 // ResumeVM restores a paused VM from its snapshot using a mount namespace.
 func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath string) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
+	tEntry := time.Now()
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate resume
 	// waits, then is recognized as a retry rather than relaunching.
@@ -1091,6 +1100,7 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	vmDir := filepath.Join(m.cfg.RunDir, rundirKey)
 	socketPath := filepath.Join(vmDir, "firecracker.sock")
 
+	tSlot := time.Now()
 	var netInfo *network.VMNetInfo
 	if inst.Namespace != "" {
 		var nsErr error
@@ -1100,10 +1110,12 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 		}
 	}
 
+	tFcStart := time.Now()
 	pid, err := m.startFirecrackerViaSystemd(ctx, vmID, socketPath, rootfsPath, inst.Config.BasePath, inst.Namespace)
 	if err != nil {
 		return nil, fmt.Errorf("start firecracker for restore: %w", err)
 	}
+	tFcDone := time.Now()
 
 	log.Info().Str("snapshot_path", snapshotPath).Msg("restoring VM from snapshot")
 	// A base is needed only when memPath is itself a diff overlay. Keying on memPath
@@ -1127,7 +1139,9 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
+	tRestore := time.Now()
 	dirtyTracked, err := m.restoreForResume(socketPath, snapshotPath, memPath, basePath, netInfo)
+	tRestoreDone := time.Now()
 	if err != nil {
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
@@ -1161,7 +1175,17 @@ func (m *Manager) ResumeVM(ctx context.Context, vmID, snapshotPath, memPath stri
 	inst.mu.Unlock()
 
 	m.persistState(inst)
-	log.Info().Int("pid", pid).Msg("VM resumed from snapshot")
+	// Resume-side phase parity with the create path's "restoring snapshot"
+	// line; wait_boxd_ms arrives async on the probe log below. prep spans
+	// the op-lock wait plus the precondition gates, so a duplicate-resume
+	// queue shows up here rather than hiding in the total.
+	log.Info().Int("pid", pid).
+		Int64("prep_ms", tSlot.Sub(tEntry).Milliseconds()).
+		Int64("ensure_slot_ms", tFcStart.Sub(tSlot).Milliseconds()).
+		Int64("fc_start_ms", tFcDone.Sub(tFcStart).Milliseconds()).
+		Int64("restore_ms", tRestoreDone.Sub(tRestore).Milliseconds()).
+		Int64("total_ms", time.Since(tEntry).Milliseconds()).
+		Msg("VM resumed from snapshot")
 
 	// Telemetry only: measure how long boxd takes to become reachable after
 	// the vCPUs resume. Detached — status is already running and the probe
@@ -1468,8 +1492,9 @@ func (m *Manager) assertUnderVMSnapshotDir(vmID, p string) error {
 // RestoreVMSnapshot boots a VM from a previously captured snapshot.
 func (m *Manager) RestoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
 	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64,
 ) (*VMInstance, error) {
-	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, "")
+	return m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, teamID, ownerID, previewAccess, previewPorts, previewPolicyRevision, "")
 }
 
 // templateRestoreAge returns seconds since this host last completed a restore of
@@ -1531,7 +1556,8 @@ func psiSomeAvg10(path string) float64 {
 // recording, in which case the in-firecracker UFFD handler writes each served
 // page offset to that file on VM shutdown.
 func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, memPath string,
-	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID, recordToPath string,
+	resourceLimits VMConfig, netCfg *network.Config, teamID, ownerID string,
+	previewAccess string, previewPorts map[int32]struct{}, previewPolicyRevision int64, recordToPath string,
 ) (*VMInstance, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
@@ -1561,6 +1587,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if existing := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
+	}
+
+	// A control plane from before preview publication sends the zero-value
+	// policy on restore. Preserve an existing in-memory or sidecar-backed policy
+	// whenever its revision is at least as new, including strict revision zero;
+	// otherwise rolling back and forward could reopen every port in memory even
+	// though StateStore correctly retained the durable sidecar.
+	previewAccess, previewPorts, previewPolicyRevision, policyErr := m.previewPolicyForRestore(
+		vmID, previewAccess, previewPorts, previewPolicyRevision,
+	)
+	if policyErr != nil {
+		return nil, status.Errorf(codes.Internal, "load existing preview policy for restore: %v", policyErr)
 	}
 
 	// Bound concurrent restores so a burst of sandbox creates doesn't
@@ -1631,6 +1669,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		MemFilePath:  memPath,
 		TeamID:       teamID,
 		OwnerID:      ownerID,
+
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          clonePreviewPorts(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
 	}
 	m.vms[vmID] = inst
 	m.mu.Unlock()
@@ -2220,12 +2262,17 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 	if m.state == nil {
 		return
 	}
+	recs, err := m.state.All()
+	if err != nil {
+		// Sweeping with an empty keep-set would delete every live VM's
+		// namespace — skip entirely when the records can't be read.
+		m.log.Error().Err(err).Msg("sweep: cannot read state — skipping orphan namespace sweep")
+		return
+	}
 	keepNs := make(map[string]bool)
-	if recs, err := m.state.All(); err == nil {
-		for _, rec := range recs {
-			if rec.Namespace != "" {
-				keepNs[rec.Namespace] = true
-			}
+	for _, rec := range recs {
+		if rec.Namespace != "" {
+			keepNs[rec.Namespace] = true
 		}
 	}
 	if swept := m.netMgr.SweepOrphanNamespaces(keepNs); swept > 0 {
@@ -2239,16 +2286,21 @@ func (m *Manager) SweepStartupOrphanNamespaces() {
 // an index a record holds. Every record is reserved unconditionally — a dead
 // record's slot is reclaimed later when the reattach cleans it up. Cheap: parses
 // slot indices, no kernel work, no systemctl.
-func (m *Manager) ReserveStartupSlots(context.Context) {
+//
+// Reports whether the reservation pass provably completed. Callers whose
+// safety depends on record slots being reserved — pool adoption treats every
+// unreserved namespace as claimable — must not proceed on false.
+func (m *Manager) ReserveStartupSlots(context.Context) bool {
 	if m.state == nil {
-		return
+		return false
 	}
 	recs, err := m.state.All()
 	if err != nil {
 		m.log.Error().Err(err).Msg("failed to read state for startup slot reservation")
-		return
+		return false
 	}
 	m.netMgr.ReserveSlotsAbove(collectStartupSlots(recs))
+	return true
 }
 
 // collectStartupSlots returns vmID→namespace for every record that has one, so
@@ -2391,6 +2443,9 @@ type InstanceInfo struct {
 	CreatedAt time.Time
 	TeamID    string
 	OwnerID   string
+
+	PreviewAccess string
+	PreviewPorts  map[int32]struct{}
 }
 
 // LookupInstance returns the address, status, and creation time of a VM.
@@ -2413,9 +2468,125 @@ func (m *Manager) LookupInstance(vmID string) (InstanceInfo, bool) {
 		CreatedAt: inst.CreatedAt,
 		TeamID:    inst.TeamID,
 		OwnerID:   inst.OwnerID,
+
+		PreviewAccess: inst.PreviewAccess,
+		PreviewPorts:  clonePreviewPorts(inst.PreviewPorts),
 	}
 	inst.mu.RUnlock()
 	return info, true
+}
+
+func clonePreviewPorts(in map[int32]struct{}) map[int32]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[int32]struct{}, len(in))
+	for port := range in {
+		out[port] = struct{}{}
+	}
+	return out
+}
+
+func normalizedPreviewAccess(access string) string {
+	if access == "" {
+		return preview.AccessLegacyPublic
+	}
+	return access
+}
+
+func previewPolicyEqual(accessA string, portsA map[int32]struct{}, accessB string, portsB map[int32]struct{}) bool {
+	if normalizedPreviewAccess(accessA) != normalizedPreviewAccess(accessB) || len(portsA) != len(portsB) {
+		return false
+	}
+	for port := range portsA {
+		if _, ok := portsB[port]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// previewPolicyForRestore merges incoming wire policy with any policy already
+// known for this VM. Revisions identify immutable snapshots, so existing state
+// wins equality. The durable sidecar is considered after memory and therefore
+// wins an equal-revision disagreement caused by an old VMD rewriting only the
+// primary lifecycle JSON.
+func (m *Manager) previewPolicyForRestore(vmID, incomingAccess string, incomingPorts map[int32]struct{}, incomingRevision int64) (string, map[int32]struct{}, int64, error) {
+	access := incomingAccess
+	ports := clonePreviewPorts(incomingPorts)
+	revision := incomingRevision
+
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst != nil {
+		inst.mu.RLock()
+		existingAccess := inst.PreviewAccess
+		existingPorts := clonePreviewPorts(inst.PreviewPorts)
+		existingRevision := inst.PreviewPolicyRevision
+		inst.mu.RUnlock()
+		if existingRevision >= revision {
+			access, ports, revision = existingAccess, existingPorts, existingRevision
+		}
+	}
+
+	if m.state != nil {
+		rec, err := m.state.Get(vmID)
+		if err != nil {
+			return "", nil, 0, err
+		}
+		if rec != nil && rec.PreviewPolicyRevision >= revision {
+			access = rec.PreviewAccess
+			ports = previewPortsFromRecord(rec.PreviewPorts)
+			revision = rec.PreviewPolicyRevision
+		}
+	}
+	return access, ports, revision, nil
+}
+
+// UpdateSandboxPreviewPolicy replaces the policy persisted on the instance
+// record. Revisions are monotonic; older snapshots are harmlessly ignored, and
+// an equal revision is idempotent only when its complete policy is identical.
+func (m *Manager) UpdateSandboxPreviewPolicy(vmID, previewAccess string, previewPorts map[int32]struct{}, revision int64) error {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return err
+	}
+	inst.mu.Lock()
+	if revision < inst.PreviewPolicyRevision {
+		inst.mu.Unlock()
+		return nil
+	}
+	if revision == inst.PreviewPolicyRevision {
+		equal := previewPolicyEqual(inst.PreviewAccess, inst.PreviewPorts, previewAccess, previewPorts)
+		inst.mu.Unlock()
+		if equal {
+			return nil
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"preview policy revision %d conflicts with the policy already stored for vm %s", revision, vmID)
+	}
+	nextPorts := clonePreviewPorts(previewPorts)
+	// Keep the instance lock through persistence. Otherwise two concurrent
+	// RPCs can apply revisions in order but race their BoltDB writes in reverse,
+	// resurrecting the stale policy after a vmd restart. Persist the intended
+	// record before advancing memory so a failed write leaves the old revision
+	// retryable instead of acknowledging a policy that a restart would lose.
+	if m.state != nil && !isBuildVM(inst.ID) {
+		record := toRecordLocked(inst)
+		record.PreviewAccess = previewAccess
+		record.PreviewPorts = previewPortsToRecord(nextPorts)
+		record.PreviewPolicyRevision = revision
+		if err := m.state.Put(record); err != nil {
+			inst.mu.Unlock()
+			return fmt.Errorf("persist preview policy: %w", err)
+		}
+	}
+	inst.PreviewAccess = previewAccess
+	inst.PreviewPorts = nextPorts
+	inst.PreviewPolicyRevision = revision
+	inst.mu.Unlock()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2663,7 +2834,7 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 		return nil
 	}
 
-	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", outputPath)
+	inst, err := m.restoreVMSnapshot(ctx, vmID, snapshotPath, memPath, resourceLimits, netCfg, "", "", "", nil, 0, outputPath)
 	if err != nil {
 		return fmt.Errorf("restore for recording: %w", err)
 	}
@@ -2848,6 +3019,7 @@ func fcStartScript(netNS, launcherNSPath, setupCmds, fcBin, socketPath, vmID str
 // owns the process, not VMD. Non-empty basePath switches the start script to
 // the dual-symlink overlay layout.
 func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string) (int, error) {
+	tPrestart := time.Now()
 	if err := os.MkdirAll(filepath.Dir(socketPath), 0o755); err != nil {
 		return 0, fmt.Errorf("mkdir socket dir: %w", err)
 	}
@@ -2865,12 +3037,24 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// legacy for THIS launch only; launcherReady stays with the sampler, so one
 	// blip can't knock the whole fleet onto the O(fleet) legacy path for a tick.
 	launcherPath := ""
-	if m.launcherReady.Load() {
-		if pin := m.launcherNSPath(); pinIsMounted(pin) {
-			launcherPath = pin
+	pin := m.launcherNSPath()
+	switch {
+	case pin == "":
+		// Launcher mode disabled: legacy is the configured path.
+	case !m.launcherReady.Load():
+		// Every launch here copies the full host mount table, so concurrent
+		// launches degrade with fleet size. launcherBuilt splits the causes:
+		// a build still in progress resolves itself; a failed build or an
+		// invalidated pin does not.
+		if m.launcherBuilt.Load() {
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin invalidated — using legacy path for this launch")
 		} else {
-			m.log.Warn().Str("path", pin).Msg("launcher pin not mounted at launch — using legacy path for this launch")
+			m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not built — using legacy path for this launch")
 		}
+	case pinIsMounted(pin):
+		launcherPath = pin
+	default:
+		m.log.Warn().Str("path", pin).Str("vm_id", vmID).Msg("launcher pin not mounted at launch — using legacy path for this launch")
 	}
 	scriptContent := fcStartScript(netNS, launcherPath, setupCmds, m.cfg.FirecrackerBin, socketPath, vmID)
 	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0o755); err != nil {
@@ -2882,8 +3066,11 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 	// it needs a bigger socket budget. Decided up front: with Type=simple
 	// the restart job clears at fork, before the socket exists, so no
 	// at-timeout probe can tell a just-replaced unit from a stalled fresh
-	// one.
+	// one. Timed separately: it is a per-launch systemd round trip, and
+	// concurrent launches serialize on the shared D-Bus connection.
+	tLinger := time.Now()
 	replacingLive := unitLingering(ctx, systemdUnitName(vmID))
+	lingerCheckMs := time.Since(tLinger).Milliseconds()
 
 	tStartUnit := time.Now()
 	if err := restartUnit(ctx, systemdUnitName(vmID)); err != nil {
@@ -2918,6 +3105,8 @@ func (m *Manager) startFirecrackerViaSystemd(ctx context.Context, vmID, socketPa
 
 	m.log.Info().
 		Str("vm_id", vmID).
+		Int64("prestart_ms", tStartUnit.Sub(tPrestart).Milliseconds()).
+		Int64("linger_check_ms", lingerCheckMs).
 		Int64("start_unit_ms", tStartUnitDone.Sub(tStartUnit).Milliseconds()).
 		Int64("wait_socket_ms", tSocketReady.Sub(tStartUnitDone).Milliseconds()).
 		Msg("fc startup phases")
