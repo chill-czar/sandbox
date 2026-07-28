@@ -14,7 +14,7 @@ import (
 // exact per-port access. Phase 3 token policy remains header-only; the Phase 4
 // browser sentinel additively permits query bootstrap and the resulting
 // host-only cookie. Unknown modes always fail closed.
-func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo, seed []byte) bool {
+func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceID string, port int, info InstanceInfo, seed []byte, preflightOriginAllowed bool) bool {
 	switch info.PreviewAccess {
 	case "", preview.AccessLegacyPublic:
 		// Preserve legacy all-port routing unless an additive Phase 2 record
@@ -53,10 +53,16 @@ func enforcePreviewPublication(w http.ResponseWriter, r *http.Request, instanceI
 		return denyPrivatePreview(w)
 	}
 	// Browsers must be able to perform a standards-compliant CORS preflight
-	// before sending a credential. OPTIONS by itself is an ordinary application
-	// request and remains authenticated.
+	// before sending a credential. Preflight headers are attacker-controlled,
+	// so answer the request at the edge and never forward an unauthenticated
+	// OPTIONS request to the private application. OPTIONS by itself remains an
+	// ordinary authenticated application request.
 	if isCORSPreflight(r) {
-		return true
+		if !preflightOriginAllowed {
+			return denyPrivatePreview(w)
+		}
+		respondPrivatePreviewPreflight(w, r)
+		return false
 	}
 	verify := func(token string) bool {
 		return auth.VerifyPreviewToken(seed, instanceID, port, version, token)
@@ -118,6 +124,26 @@ func isCORSPreflight(r *http.Request) bool {
 	return r.Method == http.MethodOptions &&
 		r.Header.Get("Origin") != "" &&
 		r.Header.Get("Access-Control-Request-Method") != ""
+}
+
+// respondPrivatePreviewPreflight grants the browser permission to send the
+// subsequent credentialed request without consulting the sandbox application.
+// The caller must first validate the requesting origin against the proxy's
+// configured allowlist. The actual request still passes through preview
+// authentication, and this response exposes no sandbox data.
+func respondPrivatePreviewPreflight(w http.ResponseWriter, r *http.Request) {
+	header := w.Header()
+	header.Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+	header.Set("Access-Control-Allow-Methods", r.Header.Get("Access-Control-Request-Method"))
+	if requestedHeaders := r.Header.Get("Access-Control-Request-Headers"); requestedHeaders != "" {
+		header.Set("Access-Control-Allow-Headers", requestedHeaders)
+	}
+	header.Set("Access-Control-Allow-Credentials", "true")
+	header.Set("Access-Control-Max-Age", "600")
+	header.Add("Vary", "Origin")
+	header.Add("Vary", "Access-Control-Request-Method")
+	header.Add("Vary", "Access-Control-Request-Headers")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // isWebSocketUpgrade requires the complete HTTP/1.1 handshake markers. A

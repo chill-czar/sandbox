@@ -18,7 +18,7 @@ import (
 
 func enforcePreviewForTest(w http.ResponseWriter, port int, info InstanceInfo) bool {
 	req := httptest.NewRequest(http.MethodGet, "http://unused/", nil)
-	return enforcePreviewPublication(w, req, "66ca164d-964b-43da-b81a-004d51598d6a", port, info, nil)
+	return enforcePreviewPublication(w, req, "66ca164d-964b-43da-b81a-004d51598d6a", port, info, nil, false)
 }
 
 func TestPreviewPublicationLegacyAllowsAnyPort(t *testing.T) {
@@ -186,7 +186,7 @@ func TestPreviewHeaderTokenAuthenticationMatrix(t *testing.T) {
 				req.Header.Add(auth.PreviewTokenHeader, value)
 			}
 			w := httptest.NewRecorder()
-			got := enforcePreviewPublication(w, req, sandboxID, port, tt.info, tt.seed)
+			got := enforcePreviewPublication(w, req, sandboxID, port, tt.info, tt.seed, false)
 			if got != tt.want {
 				t.Fatalf("allowed = %v, want %v; status=%d body=%q", got, tt.want, w.Code, w.Body.String())
 			}
@@ -197,7 +197,7 @@ func TestPreviewHeaderTokenAuthenticationMatrix(t *testing.T) {
 	}
 }
 
-func TestPreviewTokenOnlyBypassesGenuineCORSPreflight(t *testing.T) {
+func TestPreviewTokenOnlyHandlesGenuineCORSPreflightLocally(t *testing.T) {
 	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	info := InstanceInfo{
@@ -207,26 +207,59 @@ func TestPreviewTokenOnlyBypassesGenuineCORSPreflight(t *testing.T) {
 		PreviewPortTokenVersions: map[int]int64{3000: 1},
 	}
 	tests := []struct {
-		name   string
-		origin string
-		acrm   string
-		want   bool
+		name          string
+		origin        string
+		acrm          string
+		originAllowed bool
+		wantStatus    int
 	}{
-		{name: "real preflight", origin: "https://console.example", acrm: http.MethodGet, want: true},
-		{name: "plain options"},
-		{name: "origin only", origin: "https://console.example"},
-		{name: "request method only", acrm: http.MethodGet},
+		{name: "allowed preflight", origin: "https://console.example", acrm: http.MethodGet, originAllowed: true, wantStatus: http.StatusNoContent},
+		{name: "disallowed preflight", origin: "https://attacker.example", acrm: http.MethodGet, wantStatus: http.StatusUnauthorized},
+		{name: "plain options", wantStatus: http.StatusUnauthorized},
+		{name: "origin only", origin: "https://console.example", wantStatus: http.StatusUnauthorized},
+		{name: "request method only", acrm: http.MethodGet, wantStatus: http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, "http://unused/", nil)
 			req.Header.Set("Origin", tt.origin)
 			req.Header.Set("Access-Control-Request-Method", tt.acrm)
+			req.Header.Set("Access-Control-Request-Headers", auth.PreviewTokenHeader+", Content-Type")
 			w := httptest.NewRecorder()
-			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed); got != tt.want {
-				t.Fatalf("allowed = %v, want %v", got, tt.want)
+			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed); got {
+				t.Fatal("preflight or unauthenticated OPTIONS request was forwarded")
+			}
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+			if tt.wantStatus == http.StatusNoContent {
+				assertPrivatePreviewPreflightResponse(t, w, req)
 			}
 		})
+	}
+}
+
+func assertPrivatePreviewPreflightResponse(t *testing.T, w *httptest.ResponseRecorder, req *http.Request) {
+	t.Helper()
+	for name, want := range map[string]string{
+		"Access-Control-Allow-Origin":      req.Header.Get("Origin"),
+		"Access-Control-Allow-Methods":     req.Header.Get("Access-Control-Request-Method"),
+		"Access-Control-Allow-Headers":     req.Header.Get("Access-Control-Request-Headers"),
+		"Access-Control-Allow-Credentials": "true",
+		"Access-Control-Max-Age":           "600",
+	} {
+		if got := w.Header().Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
+	}
+	vary := strings.Join(w.Header().Values("Vary"), ", ")
+	for _, want := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
+		if !strings.Contains(vary, want) {
+			t.Errorf("Vary = %q, want %q", vary, want)
+		}
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("preflight body = %q, want empty", w.Body.String())
 	}
 }
 
@@ -355,7 +388,7 @@ func TestPreviewBrowserSentinelAcceptsIndependentCarrierValues(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "http://unused/path", nil)
 			tt.build(req)
 			w := httptest.NewRecorder()
-			if !enforcePreviewPublication(w, req, sandboxID, port, info, seed) {
+			if !enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) {
 				t.Fatalf("browser carrier denied: status=%d body=%q", w.Code, w.Body.String())
 			}
 		})
@@ -386,7 +419,7 @@ func TestPreviewBrowserSentinelDoesNotWeakenPhaseThreeCarrierBoundary(t *testing
 				req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid)
 			}
 			w := httptest.NewRecorder()
-			if enforcePreviewPublication(w, req, sandboxID, port, phaseThree, seed) {
+			if enforcePreviewPublication(w, req, sandboxID, port, phaseThree, seed, false) {
 				t.Fatalf("Phase 3 sentinel accepted %s carrier", carrier)
 			}
 			if w.Code != http.StatusUnauthorized {
@@ -400,7 +433,7 @@ func TestPreviewBrowserSentinelDoesNotWeakenPhaseThreeCarrierBoundary(t *testing
 	req := httptest.NewRequest(http.MethodGet, "http://unused/path", nil)
 	req.Header.Set(auth.PreviewTokenHeader, valid)
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, info, seed) || w.Code != http.StatusUnauthorized {
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) || w.Code != http.StatusUnauthorized {
 		t.Fatalf("zero-generation browser policy = allowed/status %d", w.Code)
 	}
 }
@@ -429,7 +462,7 @@ func TestPreviewBrowserQueryBootstrapIsSecureAndSameOrigin(t *testing.T) {
 	req.URL.RawQuery = "keep=%2f&" + auth.PreviewTokenQueryParam + "=stale&space=a+b&" +
 		"superserve%5fpreview_token=" + url.QueryEscape(valid) + "&bad=%zz"
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, info, seed) {
+	if enforcePreviewPublication(w, req, sandboxID, port, info, seed, false) {
 		t.Fatal("bootstrap request was forwarded instead of redirected")
 	}
 	if w.Code != http.StatusFound {
@@ -472,7 +505,7 @@ func TestPreviewBrowserQueryBootstrapRejectsInvalidTokenWithoutCookie(t *testing
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	req := httptest.NewRequest(http.MethodGet, "http://unused/?"+auth.PreviewTokenQueryParam+"=invalid", nil)
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, 3000, browserPreviewTestPolicy(3000, 1), seed) {
+	if enforcePreviewPublication(w, req, sandboxID, 3000, browserPreviewTestPolicy(3000, 1), seed, false) {
 		t.Fatal("invalid signed link was allowed")
 	}
 	if w.Code != http.StatusUnauthorized || w.Header().Get("Set-Cookie") != "" {
@@ -492,7 +525,7 @@ func TestPreviewBrowserQueryBootstrapPreservesEmptyQueryComponent(t *testing.T) 
 	req.URL.RawQuery = auth.PreviewTokenQueryParam + "=" + url.QueryEscape(valid) + "&"
 
 	w := httptest.NewRecorder()
-	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, 1), seed) {
+	if enforcePreviewPublication(w, req, sandboxID, port, browserPreviewTestPolicy(port, 1), seed, false) {
 		t.Fatal("bootstrap request was forwarded instead of redirected")
 	}
 	want := "https://" + req.Host + "/path?"
@@ -529,7 +562,7 @@ func TestPreviewBrowserQueryRedirectExceptions(t *testing.T) {
 			req.Header.Set("Upgrade", tt.upgrade)
 			req.Header.Set("Connection", tt.connection)
 			w := httptest.NewRecorder()
-			got := enforcePreviewPublication(w, req, sandboxID, port, info, seed)
+			got := enforcePreviewPublication(w, req, sandboxID, port, info, seed, false)
 			if got != tt.wantDirect {
 				t.Fatalf("direct = %v, want %v; status=%d", got, tt.wantDirect, w.Code)
 			}
@@ -540,30 +573,126 @@ func TestPreviewBrowserQueryRedirectExceptions(t *testing.T) {
 	}
 }
 
-func TestPreviewBrowserOnlyBypassesGenuineCORSPreflight(t *testing.T) {
+func TestPreviewBrowserHandlesGenuineCORSPreflightLocally(t *testing.T) {
 	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
 	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
 	info := browserPreviewTestPolicy(3000, 1)
 	for _, tt := range []struct {
-		name   string
-		origin string
-		acrm   string
-		want   bool
+		name          string
+		origin        string
+		acrm          string
+		originAllowed bool
+		wantStatus    int
 	}{
-		{name: "real", origin: "https://console.example", acrm: http.MethodGet, want: true},
-		{name: "plain options"},
-		{name: "origin only", origin: "https://console.example"},
-		{name: "method only", acrm: http.MethodGet},
+		{name: "allowed", origin: "https://console.example", acrm: http.MethodGet, originAllowed: true, wantStatus: http.StatusNoContent},
+		{name: "disallowed", origin: "https://attacker.example", acrm: http.MethodGet, wantStatus: http.StatusUnauthorized},
+		{name: "plain options", wantStatus: http.StatusUnauthorized},
+		{name: "origin only", origin: "https://console.example", wantStatus: http.StatusUnauthorized},
+		{name: "method only", acrm: http.MethodGet, wantStatus: http.StatusUnauthorized},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodOptions, "http://unused/path", nil)
 			req.Header.Set("Origin", tt.origin)
 			req.Header.Set("Access-Control-Request-Method", tt.acrm)
+			req.Header.Set("Access-Control-Request-Headers", auth.PreviewTokenHeader)
 			w := httptest.NewRecorder()
-			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed); got != tt.want {
-				t.Fatalf("allowed = %v, want %v", got, tt.want)
+			if got := enforcePreviewPublication(w, req, sandboxID, 3000, info, seed, tt.originAllowed); got {
+				t.Fatal("preflight or unauthenticated OPTIONS request was forwarded")
+			}
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tt.wantStatus)
+			}
+			if tt.wantStatus == http.StatusNoContent {
+				assertPrivatePreviewPreflightResponse(t, w, req)
 			}
 		})
+	}
+}
+
+func TestPrivatePreviewCORSPreflightNeverReachesUpstream(t *testing.T) {
+	const sandboxID = "66ca164d-964b-43da-b81a-004d51598d6a"
+	seed := []byte("preview-test-seed-that-is-at-least-thirty-two-bytes")
+	upstreamCalled := make(chan struct{}, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalled <- struct{}{}
+		http.Error(w, "private application response", http.StatusTeapot)
+	}))
+	defer upstream.Close()
+	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+
+	resolver := &stubResolver{}
+	handler := NewHandler([]string{"sandbox.test"}, resolver, zerolog.Nop()).
+		WithAuth(seed).
+		WithTerminal([]string{"https://console.example"})
+	for _, mode := range []string{preview.AccessPrivateTokenV1, preview.AccessPrivateBrowserV1} {
+		t.Run(mode, func(t *testing.T) {
+			resolver.info = InstanceInfo{
+				VMIP:                     "127.0.0.1",
+				Status:                   "running",
+				StartedAt:                1,
+				PreviewAccess:            preview.AccessPrivate,
+				PreviewPorts:             map[int]struct{}{port: {}},
+				PreviewPortAccess:        map[int]string{port: mode},
+				PreviewPortTokenVersions: map[int]int64{port: 1},
+			}
+			for _, tt := range []struct {
+				name       string
+				origin     string
+				wantStatus int
+			}{
+				{name: "allowed origin", origin: "https://console.example", wantStatus: http.StatusNoContent},
+				{name: "forged origin", origin: "https://attacker.example", wantStatus: http.StatusUnauthorized},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					req := httptest.NewRequest(http.MethodOptions, "http://unused/private", nil)
+					req.Host = fmt.Sprintf("%d-%s.sandbox.test", port, sandboxID)
+					req.Header.Set("Origin", tt.origin)
+					req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+					req.Header.Set("Access-Control-Request-Headers", auth.PreviewTokenHeader)
+					w := httptest.NewRecorder()
+
+					handler.ServeHTTP(w, req)
+
+					if w.Code != tt.wantStatus {
+						t.Fatalf("status = %d, want %d; body=%q", w.Code, tt.wantStatus, w.Body.String())
+					}
+					if tt.wantStatus == http.StatusNoContent {
+						assertPrivatePreviewPreflightResponse(t, w, req)
+					} else if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+						t.Fatalf("denied preflight exposed Access-Control-Allow-Origin %q", got)
+					}
+					select {
+					case <-upstreamCalled:
+						t.Fatal("unauthenticated preflight reached the private application")
+					default:
+					}
+				})
+			}
+		})
+	}
+
+	resolver.info = InstanceInfo{
+		VMIP:                     "127.0.0.1",
+		Status:                   "running",
+		StartedAt:                1,
+		PreviewAccess:            preview.AccessPrivate,
+		PreviewPorts:             map[int]struct{}{port: {}},
+		PreviewPortAccess:        map[int]string{port: preview.AccessPrivateBrowserV1},
+		PreviewPortTokenVersions: map[int]int64{port: 1},
+	}
+	token := mintPreviewTestToken(t, seed, sandboxID, port, 1)
+	req := httptest.NewRequest(http.MethodOptions, "http://unused/application-options", nil)
+	req.Host = fmt.Sprintf("%d-%s.sandbox.test", port, sandboxID)
+	req.Header.Set(auth.PreviewTokenHeader, token)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusTeapot {
+		t.Fatalf("authenticated application OPTIONS status = %d, want 418", w.Code)
+	}
+	select {
+	case <-upstreamCalled:
+	default:
+		t.Fatal("authenticated application OPTIONS did not reach the private application")
 	}
 }
 

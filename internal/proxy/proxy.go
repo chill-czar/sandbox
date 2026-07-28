@@ -233,7 +233,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !enforcePreviewPublication(w, r, instanceID, port, info, h.seedKey) {
+	if !enforcePreviewPublication(w, r, instanceID, port, info, h.seedKey, h.originAllowed(r.Header.Get("Origin"))) {
 		return
 	}
 
