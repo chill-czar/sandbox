@@ -755,3 +755,22 @@ func TestServeDirAsZip_AbortsOnCanceledContext(t *testing.T) {
 		t.Fatalf("zip walk wrote %d entries after the context was canceled; want 0 (aborted)", len(zr.File))
 	}
 }
+
+func TestFileUpload_Success(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "upload.txt")
+	req := httptest.NewRequest(http.MethodPost, "/files?path="+url.QueryEscape(p), strings.NewReader("uploaded data"))
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	content, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read uploaded file: %v", err)
+	}
+	if string(content) != "uploaded data" {
+		t.Errorf("content = %q, want %q", string(content), "uploaded data")
+	}
+}
+
