@@ -166,20 +166,24 @@ func (s *processService) handleExec(w http.ResponseWriter, r *http.Request) {
 		defer mu.Unlock()
 		switch x := ev.Event.(type) {
 		case *pb.ProcessEvent_Data:
-			switch out := x.Data.Output.(type) {
-			case *pb.DataEvent_Stdout:
-				stdout = appendCapped(stdout, out.Stdout)
-			case *pb.DataEvent_Stderr:
-				stderr = appendCapped(stderr, out.Stderr)
-			case *pb.DataEvent_PtyData:
-				stdout = appendCapped(stdout, out.PtyData)
+			if x.Data != nil && x.Data.Output != nil {
+				switch out := x.Data.Output.(type) {
+				case *pb.DataEvent_Stdout:
+					stdout = appendCapped(stdout, out.Stdout)
+				case *pb.DataEvent_Stderr:
+					stderr = appendCapped(stderr, out.Stderr)
+				case *pb.DataEvent_PtyData:
+					stdout = appendCapped(stdout, out.PtyData)
+				}
 			}
 		case *pb.ProcessEvent_Start:
 			if tSpawn.IsZero() {
 				tSpawn = time.Now()
 			}
 		case *pb.ProcessEvent_End:
-			exitCode = x.End.ExitCode
+			if x.End != nil {
+				exitCode = x.End.ExitCode
+			}
 		}
 		return nil
 	}
@@ -268,16 +272,20 @@ func (s *processService) handleExecStream(w http.ResponseWriter, r *http.Request
 		}
 		switch x := ev.Event.(type) {
 		case *pb.ProcessEvent_Data:
-			switch out := x.Data.Output.(type) {
-			case *pb.DataEvent_Stdout:
-				payload["stdout"] = string(out.Stdout)
-			case *pb.DataEvent_Stderr:
-				payload["stderr"] = string(out.Stderr)
-			case *pb.DataEvent_PtyData:
-				payload["stdout"] = string(out.PtyData)
+			if x.Data != nil && x.Data.Output != nil {
+				switch out := x.Data.Output.(type) {
+				case *pb.DataEvent_Stdout:
+					payload["stdout"] = string(out.Stdout)
+				case *pb.DataEvent_Stderr:
+					payload["stderr"] = string(out.Stderr)
+				case *pb.DataEvent_PtyData:
+					payload["stdout"] = string(out.PtyData)
+				}
 			}
 		case *pb.ProcessEvent_End:
-			payload["exit_code"] = x.End.ExitCode
+			if x.End != nil {
+				payload["exit_code"] = x.End.ExitCode
+			}
 			payload["finished"] = true
 		case *pb.ProcessEvent_Start:
 			return nil
