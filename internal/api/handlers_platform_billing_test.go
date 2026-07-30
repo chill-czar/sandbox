@@ -60,6 +60,15 @@ func TestPlatformBillingRequiredRateCountIgnoresFutureRates(t *testing.T) {
 	}
 }
 
+func TestPlatformBillingReconstructsCurrentPeriodCreditsFromLedger(t *testing.T) {
+	if !strings.Contains(platformBillingChargesQuery, "team_credit_ledger") {
+		t.Fatal("billing query should read the current-period credit ledger")
+	}
+	if !strings.Contains(platformBillingChargesQuery, "available_credits") {
+		t.Fatal("billing query should reconstruct an available-credits balance")
+	}
+}
+
 func TestPlatformBillingStableSortingTreatsErrorsAsSecondaryKey(t *testing.T) {
 	if !strings.Contains(platformBillingChargesQuery, "CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END ASC") {
 		t.Fatal("billing sort should keep error rows behind successful rows")

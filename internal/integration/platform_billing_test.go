@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 type platformBillingTestResponse struct {
@@ -127,5 +131,110 @@ func TestPlatformBillingPaginationTotalsAndPartialFailures(t *testing.T) {
 	denied := doInternal(r, http.MethodGet, "/internal/billing?search="+prefix, unprivileged.String(), "")
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("unprivileged platform billing status = %d, want 403: %s", denied.Code, denied.Body.String())
+	}
+}
+
+func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newInternalRouter(t)
+
+	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"platform-billing-ledger"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
+	}
+	sandboxID, err := uuid.Parse(mustJSON(t, cw)["id"].(string))
+	if err != nil {
+		t.Fatalf("parse sandbox id: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_compute_billing_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded compute billing interval: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_storage_interval WHERE sandbox_id = $1`, sandboxID); err != nil {
+		t.Fatalf("clear seeded storage billing interval: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("upsert billing period: %v", err)
+	}
+
+	start := periodStart.Add(15 * time.Minute)
+	end := start.Add(1 * time.Hour)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (
+			sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 2, 2048, $3, $4, 'paused')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed compute billing usage: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (
+			sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason
+		)
+		VALUES ($1, $2, 10240, $3, $4, 'deleted')
+	`, sandboxID, teamID, start, end); err != nil {
+		t.Fatalf("seed storage billing usage: %v", err)
+	}
+
+	var grantID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, updated_at)
+		VALUES ($1, 0.100000, 0.060000, 'opening balance test grant', $2, $2)
+		RETURNING id
+	`, teamID, periodStart.Add(-time.Hour)).Scan(&grantID); err != nil {
+		t.Fatalf("seed credit grant: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_ledger (
+			team_id, grant_id, billing_period_start, billing_period_end, amount_usd, reason
+		)
+		VALUES ($1, $2, $3, $4, 0.040000, 'billing period finalization credit application')
+	`, teamID, grantID, periodStart, periodEnd); err != nil {
+		t.Fatalf("seed current-period credit ledger: %v", err)
+	}
+
+	actorID := seedPlatformAdminProfile(t)
+	resp := doInternal(
+		r,
+		http.MethodGet,
+		fmt.Sprintf("/internal/billing?search=%s&sort=team_name&order=asc", teamID.String()),
+		actorID.String(),
+		"",
+	)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("platform billing response: %d %s", resp.Code, resp.Body.String())
+	}
+
+	body := decodePlatformBilling(t, resp.Body.Bytes())
+	if len(body.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(body.Rows))
+	}
+	row := body.Rows[0]
+	if row.TeamID != teamID.String() {
+		t.Fatalf("team_id = %s, want %s", row.TeamID, teamID)
+	}
+	if row.Error != nil {
+		t.Fatalf("unexpected billing error: %+v", row.Error)
+	}
+	if row.Summary == nil {
+		t.Fatal("summary missing")
+	}
+	currentCharges, ok := row.Summary["current_charges_usd"].(float64)
+	if !ok || currentCharges <= 0.1 {
+		t.Fatalf("current_charges_usd = %v, want > 0.1", row.Summary["current_charges_usd"])
+	}
+	if got := row.Summary["credits_applied_usd"].(float64); got < 0.099999 || got > 0.100001 {
+		t.Fatalf("credits_applied_usd = %v, want 0.1", got)
+	}
+	if got := row.Summary["credits_remaining_usd"].(float64); got < -0.000001 || got > 0.000001 {
+		t.Fatalf("credits_remaining_usd = %v, want 0", got)
 	}
 }

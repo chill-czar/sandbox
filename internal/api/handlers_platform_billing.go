@@ -263,12 +263,31 @@ credits AS (
 	LEFT JOIN team_credit_grant g ON g.team_id = sp.team_id
 	GROUP BY sp.team_id
 ),
+current_period_ledger AS (
+	SELECT
+		sp.team_id,
+		COALESCE(SUM(l.amount_usd) FILTER (WHERE l.amount_usd > 0), 0)::numeric AS applied_usd
+	FROM selected_plans sp
+	LEFT JOIN team_credit_ledger l
+	  ON l.team_id = sp.team_id
+	 AND l.billing_period_start = sp.period_start
+	 AND l.billing_period_end = sp.period_end
+	GROUP BY sp.team_id
+),
+available_credits AS (
+	SELECT
+		sp.team_id,
+		(credits.available_usd + COALESCE(current_period_ledger.applied_usd, 0)) AS available_usd
+	FROM selected_plans sp
+	JOIN credits ON credits.team_id = sp.team_id
+	LEFT JOIN current_period_ledger ON current_period_ledger.team_id = sp.team_id
+),
 costed AS (
 	SELECT
 		sp.*,
 		r.plan_name,
 		r.currency,
-		c.available_usd,
+		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
 		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
@@ -281,9 +300,9 @@ costed AS (
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
+	JOIN available_credits ac ON ac.team_id = sp.team_id
 	JOIN compute_usage cu ON cu.team_id = sp.team_id
 	JOIN storage_usage su ON su.team_id = sp.team_id
-	JOIN credits c ON c.team_id = sp.team_id
 ),
 billed AS (
 	SELECT
@@ -499,12 +518,31 @@ credits AS (
 	LEFT JOIN team_credit_grant g ON g.team_id = sp.team_id
 	GROUP BY sp.team_id
 ),
+current_period_ledger AS (
+	SELECT
+		sp.team_id,
+		COALESCE(SUM(l.amount_usd) FILTER (WHERE l.amount_usd > 0), 0)::numeric AS applied_usd
+	FROM selected_plans sp
+	LEFT JOIN team_credit_ledger l
+	  ON l.team_id = sp.team_id
+	 AND l.billing_period_start = sp.period_start
+	 AND l.billing_period_end = sp.period_end
+	GROUP BY sp.team_id
+),
+available_credits AS (
+	SELECT
+		sp.team_id,
+		(credits.available_usd + COALESCE(current_period_ledger.applied_usd, 0)) AS available_usd
+	FROM selected_plans sp
+	JOIN credits ON credits.team_id = sp.team_id
+	LEFT JOIN current_period_ledger ON current_period_ledger.team_id = sp.team_id
+),
 costed AS (
 	SELECT
 		sp.*,
 		r.plan_name,
 		r.currency,
-		c.available_usd,
+		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
 		((su.storage_mib_seconds / 1024.0) * r.storage_rate) AS storage_usd,
@@ -517,9 +555,9 @@ costed AS (
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
+	JOIN available_credits ac ON ac.team_id = sp.team_id
 	JOIN compute_usage cu ON cu.team_id = sp.team_id
 	JOIN storage_usage su ON su.team_id = sp.team_id
-	JOIN credits c ON c.team_id = sp.team_id
 ),
 billed AS (
 	SELECT
