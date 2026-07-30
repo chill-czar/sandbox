@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -51,7 +52,7 @@ func parsePlatformBillingParams(c *gin.Context) (platformBillingParams, error) {
 		params.Offset = *page.Offset
 	}
 	search := strings.TrimSpace(c.Query("search"))
-	if len(search) > 200 {
+	if utf8.RuneCountInString(search) > 200 {
 		return platformBillingParams{}, errors.New("search must be at most 200 characters")
 	}
 	if escaped := searchTerm(search); escaped != nil {

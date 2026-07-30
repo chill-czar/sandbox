@@ -40,6 +40,17 @@ func TestParsePlatformBillingParams(t *testing.T) {
 			t.Fatal("expected long search to be rejected")
 		}
 	})
+
+	t.Run("search counts characters not bytes", func(t *testing.T) {
+		search := strings.Repeat("搜索", 100)
+		got, err := parsePlatformBillingParams(pageCtx(t, "search="+search))
+		if err != nil {
+			t.Fatalf("parse multibyte search: %v", err)
+		}
+		if want := searchTerm(search); want == nil || got.Search != *want {
+			t.Fatalf("search = %q, want escaped literal", got.Search)
+		}
+	})
 }
 
 func TestPlatformBillingQuerySelection(t *testing.T) {
