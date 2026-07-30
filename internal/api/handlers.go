@@ -92,6 +92,11 @@ type Handlers struct {
 	// across requests. Built lazily from Pool on first use.
 	authzOnce sync.Once
 	authzSvc  *authz.Service
+
+	// hostCaps is the positive-only host-capability attestation cache used by
+	// the standalone pre-flight checks (see hostcap_cache.go). Zero value is
+	// ready to use.
+	hostCaps hostCapCache
 }
 
 // asyncBookkeeping runs fire-and-forget post-VMD work in a background
@@ -439,19 +444,20 @@ func (h *Handlers) loadActiveSandbox(c *gin.Context) *db.Sandbox {
 // loadActiveOrResumeSandbox is like loadActiveSandbox but auto-resumes a
 // paused sandbox, and waits out the activate settle window on a
 // starting/resuming row before giving up. Any other non-active state
-// returns 409.
-func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
+// returns 409. Also returns the sandbox's effective preview access (read in
+// the same round-trip); "" when the sandbox is nil.
+func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, string) {
 	sandboxID, err := parseSandboxID(c)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	teamID, err := teamIDFromContext(c)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	deadline := time.Now().Add(activateSettleWindow)
 	for {
-		sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+		row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
@@ -459,20 +465,24 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 			if err == pgx.ErrNoRows {
 				respondError(c, ErrSandboxNotFound)
 			} else {
-				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxWithPreviewPolicy failed")
 				respondError(c, ErrInternal)
 			}
-			return nil
+			return nil, ""
 		}
+		sandbox := row.Sandbox
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
-			return &sandbox
+			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
-			if !h.resumePausedSandbox(c, &sandbox, teamID) {
-				return nil
+			// The resume returns the post-restore access it pushed to VMD, so
+			// the response reports exactly what the VM enforces.
+			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
+			if !ok {
+				return nil, ""
 			}
 			sandbox.Status = db.SandboxStatusActive
-			return &sandbox
+			return &sandbox, resumedAccess
 		case db.SandboxStatusStarting, db.SandboxStatusResuming:
 			// Likely the fire-and-forget activate write in flight (or a
 			// concurrent create/resume finishing); wait for the flip
@@ -482,10 +492,10 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 				continue
 			}
 			respondError(c, ErrInvalidState)
-			return nil
+			return nil, ""
 		default:
 			respondError(c, ErrInvalidState)
-			return nil
+			return nil, ""
 		}
 	}
 }
@@ -494,13 +504,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) *db.Sandbox {
 // the sandbox to active. Starts with an atomic paused→resuming DB claim so
 // concurrent resumes don't both call VMD; the loser gets 409. On any failure
 // after VMD resume succeeds, destroys the VM + reverts to paused.
-func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) bool {
+func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
 	sandboxID := sandbox.ID
 
 	if !sandbox.SnapshotID.Valid {
 		log.Error().Str("sandbox_id", sandboxID.String()).Msg("paused sandbox has no snapshot_id")
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 
 	// Resolve the effective policy before claiming the sandbox. A missing
@@ -511,11 +521,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	if err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("load preview policy for resume failed")
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 	if resumePolicy.requiresBrowserCapability() {
 		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
-			return false
+			return "", false
 		}
 		// A Phase 2 VMD may still hold a raw-private snapshot at the previous
 		// revision. Advance under the sandbox row lock before restoring so the
@@ -528,11 +538,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		})
 		if err != nil {
 			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
-				return false
+				return "", false
 			}
 		}
 	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
-		return false
+		return "", false
 	}
 	resumeVMDAccess := resumePolicy.vmdAccess()
 
@@ -568,16 +578,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// Someone else is already resuming, or the sandbox is no longer
 			// in paused state. Surface as conflict; client retries.
 			respondError(c, ErrInvalidState)
-			return false
+			return "", false
 		}
 		if isSandboxQuotaErr(err) {
 			// Resuming re-enters the active set; the team is already at its limit.
 			h.respondQuotaExceeded(c, teamID)
-			return false
+			return "", false
 		}
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginResume failed")
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 	*sandbox = claimed
 
@@ -601,7 +611,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSnapshot failed")
 		revertToPaused()
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 
 	snapshotPath := snapshot.Path
@@ -628,7 +638,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		log.Error().Err(vmdLookupErr).Str("sandbox_id", sandboxID.String()).Msg("resolve VMD for resume failed")
 		revertToPaused()
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 
 	// The snapshot carries the agent's HTTPS_PROXY (with its JWT) and stand-in
@@ -664,14 +674,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				// reaps the paused-row/active-VM state if no retry comes.
 				revertToPaused()
 				respondError(c, ErrInternal)
-				return false
+				return "", false
 			}
 		} else {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("VMD ResumeInstance failed")
 			// Same deliberate no-destroy as the fallback branch above.
 			revertToPaused()
 			respondError(c, ErrInternal)
-			return false
+			return "", false
 		}
 	}
 
@@ -741,7 +751,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reload preview policy after resume failed")
 		pauseAndRevert()
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 	// A private publication may have changed while the VM was restoring. Gate
 	// the final authoritative reapply against the host's current browser
@@ -751,7 +761,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
 			pauseAndRevert()
 			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
-			return false
+			return "", false
 		}
 	}
 	if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
@@ -764,7 +774,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			log.Error().Err(policyErr).Str("sandbox_id", sandboxID.String()).Msg("reapply preview policy after resume failed")
 			pauseAndRevert()
 			respondError(c, ErrInternal)
-			return false
+			return "", false
 		}
 	}
 
@@ -774,7 +784,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("reapply network config on resume failed")
 		pauseAndRevert()
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	}
 
 	// Re-apply the current binding set before committing to 'active', so a secret
@@ -786,13 +796,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		log.Error().Err(merr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings on resume failed")
 		pauseAndRevert()
 		respondError(c, ErrInternal)
-		return false
+		return "", false
 	} else if len(meta) > 0 {
 		if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
 			log.Error().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("reapply secret bindings on resume failed")
 			pauseAndRevert()
 			respondError(c, ErrInternal)
-			return false
+			return "", false
 		}
 	}
 
@@ -827,7 +837,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "resumed", "success", &sandbox.Name, nil, nil)
 	h.capture(c, "sandbox_resumed", map[string]any{"sandbox_id": sandboxID.String()})
-	return true
+	return currentPolicy.Access, true
 }
 
 // resolveMemPath returns the memory snapshot path from a Snapshot record.
@@ -976,18 +986,12 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 		return
 	}
 
-	sandbox := h.loadActiveOrResumeSandbox(c)
+	sandbox, previewAccess := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}
-	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandbox.ID, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandbox.ID.String()).Msg("DB GetSandboxPreviewPolicy failed")
-		respondError(c, ErrInternal)
-		return
-	}
 	resp := h.sandboxToResponseWithToken(*sandbox)
-	resp.PreviewAccess = policy.Access
+	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1025,7 +1029,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	if !h.resumePausedSandbox(c, &sandbox, teamID) {
+	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID); !ok {
 		return
 	}
 
@@ -1585,7 +1589,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	sandbox, err := h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+	row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
@@ -1594,19 +1598,14 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			respondError(c, ErrSandboxNotFound)
 			return
 		}
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxWithPreviewPolicy failed")
 		respondError(c, ErrInternal)
 		return
 	}
+	sandbox := row.Sandbox
 
 	resp := h.sandboxToResponse(sandbox)
-	policy, err := h.loadPreviewPolicy(c.Request.Context(), sandboxID, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandboxPreviewPolicy failed")
-		respondError(c, ErrInternal)
-		return
-	}
-	resp.PreviewAccess = policy.Access
+	resp.PreviewAccess = row.Access
 	canWrite, permErr := h.customerTeamPermissionAllowed(c, teamID, "settings:write")
 	if permErr != nil {
 		log.Error().
@@ -1616,7 +1615,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
 		resp = h.sandboxToResponseWithToken(sandbox)
-		resp.PreviewAccess = policy.Access
+		resp.PreviewAccess = row.Access
 	}
 	if !isConsoleImpersonation(c) {
 		resp.Secrets = h.fetchSandboxSecretBindings(c.Request.Context(), sandboxID)
@@ -1814,8 +1813,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	SetTelemetryHostID(c, hostID)
 
 	// Re-attest after placement. The scheduler cache and the default-host path
-	// are only hints; heartbeat capability state can change between selection
-	// and VM creation.
+	// are only hints; this re-check is fresher (attestation-cache TTL vs the
+	// scheduler's candidate TTL), and VMD's post-boot policy attestation
+	// remains the fail-closed gate.
 	if previewAccess == preview.AccessPrivate {
 		if !h.requireHostPreviewPortBrowserAuth(c, hostID) {
 			return
@@ -2481,7 +2481,7 @@ func (h *Handlers) ListSandboxFiles(c *gin.Context) {
 		return
 	}
 
-	sandbox := h.loadActiveOrResumeSandbox(c)
+	sandbox, _ := h.loadActiveOrResumeSandbox(c)
 	if sandbox == nil {
 		return
 	}
