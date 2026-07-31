@@ -774,3 +774,30 @@ func TestFileUpload_Success(t *testing.T) {
 	}
 }
 
+type enospcReader struct{}
+
+func (enospcReader) Read(p []byte) (int, error) {
+	return 0, syscall.ENOSPC
+}
+
+func (enospcReader) Close() error {
+	return nil
+}
+
+func TestFileUpload_StorageFull(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "partial.txt")
+	req := httptest.NewRequest(http.MethodPost, "/files?path="+url.QueryEscape(p), enospcReader{})
+	w := httptest.NewRecorder()
+	handleFiles(w, req)
+
+	if w.Code != http.StatusInsufficientStorage {
+		t.Fatalf("status = %d, want 507 (Insufficient Storage); body: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "sandbox_storage_full") {
+		t.Errorf("body = %q, want code sandbox_storage_full", w.Body.String())
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("partial file %s still exists; want it to be removed on ENOSPC", p)
+	}
+}
