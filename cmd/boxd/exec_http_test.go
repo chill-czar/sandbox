@@ -451,48 +451,20 @@ func TestExec_NilProcessEventsDoesNotPanic(t *testing.T) {
 		t.Fatalf("handleExecStream status = %d, want 200; body: %s", w2.Code, w2.Body.String())
 	}
 
-	// 2. Directly verify that nil Data/Output/End events do not cause a nil pointer panic.
+	// 2. Directly verify that nil Data/Output/End events do not cause a nil pointer panic when passed to parseProcessEvent.
 	nilEvents := []*pb.ProcessEvent{
+		nil,
 		{Event: &pb.ProcessEvent_Data{Data: nil}},
 		{Event: &pb.ProcessEvent_Data{Data: &pb.DataEvent{Output: nil}}},
 		{Event: &pb.ProcessEvent_End{End: nil}},
 	}
 
-	// Test emit logic from handleExec with nil events
-	var (
-		mu       sync.Mutex
-		stdout   []byte
-		stderr   []byte
-		exitCode int32
-	)
-	execEmit := func(ev *pb.ProcessEvent) error {
-		mu.Lock()
-		defer mu.Unlock()
-		switch x := ev.Event.(type) {
-		case *pb.ProcessEvent_Data:
-			if x.Data != nil && x.Data.Output != nil {
-				switch out := x.Data.Output.(type) {
-				case *pb.DataEvent_Stdout:
-					stdout = append(stdout, out.Stdout...)
-				case *pb.DataEvent_Stderr:
-					stderr = append(stderr, out.Stderr...)
-				}
-			}
-		case *pb.ProcessEvent_End:
-			if x.End != nil {
-				exitCode = x.End.ExitCode
-			}
-		}
-		return nil
-	}
-
 	for _, ev := range nilEvents {
-		if err := execEmit(ev); err != nil {
-			t.Errorf("execEmit returned unexpected error: %v", err)
+		out, exitCode, isStart := parseProcessEvent(ev)
+		if out != nil || exitCode != nil || isStart {
+			t.Errorf("parseProcessEvent(%v) = (%v, %v, %v); want nil, nil, false", ev, out, exitCode, isStart)
 		}
 	}
-	_ = stdout
-	_ = stderr
-	_ = exitCode
 }
+
 
