@@ -25,6 +25,7 @@ on:
       - 'cmd/boxd/**'
       - 'cmd/template-builder/**'
       - 'cmd/secretsproxy/**'
+      - 'proto/**'
       - 'internal/vm/**'
       - 'internal/network/**'
       - 'internal/builder/**'
@@ -36,6 +37,8 @@ on:
       - 'deploy/firecracker@.service'
       - 'deploy/firecracker-netns@.service'
       - 'deploy/sandboxes.slice'
+      - 'deploy/needrestart-superserve.conf'
+      - 'deploy/apt-no-auto-upgrades.conf'
       - 'scripts/fc-cleanup'
       # The workflow + its deploy script must self-trigger (as deploy-otel does),
       # or a new cell/step lands without ever running until an unrelated vmd
