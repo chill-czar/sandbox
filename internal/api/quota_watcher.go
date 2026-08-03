@@ -317,7 +317,7 @@ func (n *EmailQuotaNotifier) Notify(ctx context.Context, a QuotaAlert) error {
 	payload := map[string]any{
 		"from":    n.from,
 		"to":      []string{to},
-		"subject": "Verify your team on Superserve",
+		"subject": "Sandbox limit reached for your team",
 		"html":    quotaEmailHTML(a),
 	}
 	body, err := json.Marshal(payload)

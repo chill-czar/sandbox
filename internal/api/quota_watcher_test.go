@@ -134,8 +134,8 @@ func TestEmailQuotaNotifierSends(t *testing.T) {
 	if len(payload.To) != 1 || payload.To[0] != "owner@acme.test" {
 		t.Errorf("to = %v, want [owner@acme.test]", payload.To)
 	}
-	if !strings.Contains(payload.Subject, "Verify your team") {
-		t.Errorf("subject = %q, want it to mention verification", payload.Subject)
+	if !strings.Contains(payload.Subject, "Sandbox limit reached") {
+		t.Errorf("subject = %q, want it to mention limit reached", payload.Subject)
 	}
 	if !strings.Contains(payload.HTML, "Verify your team on Superserve") || !strings.Contains(payload.HTML, "Book a Meeting") {
 		t.Errorf("html missing verification heading/CTA: %q", payload.HTML)
