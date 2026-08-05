@@ -2406,7 +2406,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		TeamID: teamID,
 	})
 	if err != nil {
-		if err != pgx.ErrNoRows {
+		if !errors.Is(err, pgx.ErrNoRows) {
 			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB BeginPause failed")
 			respondError(c, ErrInternal)
 			return
