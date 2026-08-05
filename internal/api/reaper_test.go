@@ -415,4 +415,7 @@ func TestCleanupExpiredRevocations_IndependentTimeouts(t *testing.T) {
 	if d := secondDeadline.Sub(now); d < budget-slack {
 		t.Errorf("second call deadline too soon: %v remaining (want >= %v)", d, budget-slack)
 	}
+	if !secondDeadline.After(firstDeadline) {
+		t.Errorf("second deadline (%v) must be strictly after first deadline (%v)", secondDeadline, firstDeadline)
+	}
 }
