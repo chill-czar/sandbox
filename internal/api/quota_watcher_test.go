@@ -134,10 +134,10 @@ func TestEmailQuotaNotifierSends(t *testing.T) {
 	if len(payload.To) != 1 || payload.To[0] != "owner@acme.test" {
 		t.Errorf("to = %v, want [owner@acme.test]", payload.To)
 	}
-	if !strings.Contains(payload.Subject, "Sandbox limit reached") {
-		t.Errorf("subject = %q, want it to mention limit reached", payload.Subject)
+	if !strings.Contains(payload.Subject, "approaching your sandbox limit") {
+		t.Errorf("subject = %q, want it to mention approaching limit", payload.Subject)
 	}
-	if !strings.Contains(payload.HTML, "Sandbox limit reached for your team") || !strings.Contains(payload.HTML, "Book a Meeting") {
+	if !strings.Contains(payload.HTML, "You're approaching your sandbox limit") || !strings.Contains(payload.HTML, "Book a Meeting") {
 		t.Errorf("html missing quota limit heading/CTA: %q", payload.HTML)
 	}
 }
