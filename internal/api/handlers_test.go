@@ -1748,6 +1748,9 @@ func TestActivateSandbox_ClientDisconnectDuringSettle(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("handler took %v after client disconnect; expected near-instant abort", elapsed)
 	}
+	if w.Body.Len() > 0 {
+		t.Errorf("body length = %d, want 0 (no response should be written on client disconnect)", w.Body.Len())
+	}
 }
 
 func TestActivateSandbox_InvalidUUID(t *testing.T) {

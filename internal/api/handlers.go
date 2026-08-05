@@ -550,8 +550,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 				select {
 				case <-time.After(activateSettlePoll):
 				case <-c.Request.Context().Done():
-					respondError(c, ErrInternal)
-					return nil
+					return nil, ""
 				}
 				continue
 			}
